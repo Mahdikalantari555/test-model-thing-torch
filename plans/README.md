@@ -20,6 +20,14 @@ Guiding decisions, fixed up front:
 
 Read order: `01_source_analysis.md` → the contracts → verification.
 
-Every spec marks items that must be confirmed against the MLX runtime as
-`[VERIFY]`. Those are the things I could not derive purely from reading
-source and that would silently break numerical similarity if guessed wrong.
+Every spec used to mark items that must be confirmed against the MLX runtime
+as `[VERIFY]`. **All seven are now RESOLVED** — MLX cannot execute in this
+environment (Linux wheel is CUDA-only, no GPU), so the defaults were confirmed
+by reading the installed `mlx` 0.32.2 package source directly. Citations and
+the exact consequences for the port are in `01_source_analysis.md` under
+"RESOLVED — MLX 0.32.2 defaults".
+
+One decision is still open and blocks Phase A: the trace buffers
+(`states`/`decaytrace`/`embedtrace`) are genuinely in MLX's
+`trainable_parameters()`, so the optimizer clobbers the manually-set
+`stop_gradient` state by ~1.6e-3/step. Bug-for-bug vs. fix — see 01 #7.

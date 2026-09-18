@@ -16,11 +16,12 @@ Tests encode it. Implementation just satisfies tests.
 Inputs:  c: int in [0, 255]
 Output:  tensor shape (dim,), dtype float32
 Params:  weight (256, dim)
-Init:    [VERIFY] MLX Embedding init scheme
+Init:    MLX: normal, std = 1/sqrt(dim)  (see 01_source_analysis.md RESOLVED #1)
+         Port must reinit: nn.init.normal_(weight, std=1/sqrt(dim))
 Test:    tests/test_embedding.py
          - shape (dim,)
          - identical dims
-         - [VERIFY] whether init values can be reproduced
+         - init values reproducible (reinit with the MLX scheme above)
 
 ## Layer (RTU)
 
@@ -73,7 +74,8 @@ current latent. This is the JEPA-style latent prediction.
   L_stop = mean(square(stop - (1.0 if end else 0.0)))  # only if nextb is not None
   L_total = L_var + L_pred + L_ce + L_stop
 
-[VERIFY] var(x) ddof: population or sample?
+var(x) ddof: **population (ddof=0)** — MLX default, confirmed in source.
+  Port must use torch.var(unbiased=False), else the variance loss term scales wrong.
 
 ## Custom gradient hooks (CRITICAL)
 
@@ -97,8 +99,13 @@ Interpretation: embedtrace is a decayed one-hot accumulator of the
 input byte. decaytrace is a decayed accumulator of the state. Both feed
 custom gradients into the encoder embedding and the decay gate.
 
-[VERIFY] Do these ADD to autodiff grads or REPLACE them?
-[VERIFY] Are states/decaytrace/embedtrace excluded from trainable_parameters()?
+[RESOLVED] Asymmetric: `grads["encoder"]["embed"]["weight"] += ...` ADDS to autodiff;
+  `grads["layers"][i]["decay"] = ...` REPLACES autodiff (plain `=`). See 01 #6.
+
+[RESOLVED] states/decaytrace/embedtrace are NOT excluded — they ARE in
+  trainable_parameters() (MLX's filter has no weight-vs-buffer distinction;
+  only the `_` prefix and `_no_grad` set matter). Consequence: the optimizer
+  updates them too, clobbering the just-set stop_gradient state. See 01 #7.
 
 ## Sampling
 

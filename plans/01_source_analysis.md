@@ -86,14 +86,69 @@ Decoder: 256*dim (decode) + dim (stop weight) + 1 (stop bias)
 Encoder: 256*dim
 For dim=512, layers=16 -> 4.5M. Matches README.
 
-## [VERIFY] Items needing MLX runtime confirmation
+## RESOLVED — MLX 0.32.2 defaults (verified against installed source)
 
-1. nn.Embedding init scheme and nn.Linear init scheme in MLX.
-   Affects identical initialization (Component A requirement).
-2. MLX var(x) default: unbiased (ddof=1) or population (ddof=0)?
-   Directly affects the variance loss magnitude.
-3. Whether MLX LayerNorm uses bias by default and its init.
-4. MLX AdamW bias correction and weight decay placement.
-5. Whether the hand-written grad hooks override or augment autodiff grads.
-6. Whether states/decaytrace/embedtrace are trainable_parameters() or not
-   (they are mutated in place, not via optimizer).
+MLX cannot execute in this environment (Linux wheel is CUDA-only;
+`libmlx.so` absent, no GPU). The defaults below were confirmed by reading
+the installed `mlx` 0.32.2 package source directly, not by running it.
+This supersedes every `[VERIFY]` annotation in this repo's plans.
+
+1. **nn.Embedding init** — `nn/layers/embedding.py:17-18`
+   `scale = sqrt(1/dims); weight = mx.random.normal(shape=(V,dims), scale=scale)`
+   → **normal, std = 1/√dim**. PyTorch `nn.Embedding` default is `normal(0,1)`
+   (unscaled). The port MUST reinit: `nn.init.normal_(emb.weight, std=1/sqrt(dim))`.
+
+2. **nn.Linear init** — `nn/layers/linear.py:62-68`
+   `scale = sqrt(1/input_dims); weight,bias = uniform(-scale, scale)`
+   → **uniform(±1/√fan_in)**. This is exactly PyTorch's own `nn.Linear` default
+   (`kaiming_uniform_(a=√5)` reduces to bound `1/√fan_in`). **No reinit needed.**
+
+3. **LayerNorm** — `nn/layers/normalization.py`, `LayerNorm.__init__`
+   `eps=1e-5, affine=True, bias=True, weight=ones, bias=zeros`
+   → **identical to PyTorch `nn.LayerNorm` defaults**. No action.
+
+4. **mx.var ddof** — `core/__init__.pyi:2513`
+   `def var(a, ..., ddof=0, ...)` → **population variance (ddof=0)**.
+   PyTorch `torch.var` defaults to `unbiased=True` (ddof=1). The port MUST pass
+   `unbiased=False`, else the variance loss term is scaled wrong.
+
+5. **MLX AdamW** — `optimizers.py:579-580, 538-545`
+   `weight_decay=0.01` (default — the repo's `opt.AdamW(learning_rate=lr)` call
+   never overrides it, so **weight decay 0.01 is silently active**),
+   `bias_correction=False` (default). Uncorrected path is literally
+   `parameter - lr * m / (sqrt(v) + eps)`. Bias correction is gated behind an `if`.
+   → The port needs a **custom Adam step**; stock `torch.optim.AdamW` always
+   applies bias correction with no flag to disable it. Decoupled weight decay
+   (`param *= (1 - lr*wd)` before the Adam update, `optimizers.py:590`) matches
+   PyTorch's decoupled form, so only the bias-correction piece differs.
+
+6. **Custom grad hooks: add vs replace** — `main.py:117-121`
+   Asymmetric: `grads["encoder"]["embed"]["weight"] += ...` (**adds** to autodiff),
+   `grads["layers"][i]["decay"] = ...` (**replaces** autodiff — plain `=`, the
+   sigmoid-through-decay gradient is discarded).
+
+7. **states/decaytrace/embedtrace in trainable_parameters()?** — YES.
+   `nn/layers/base.py:235-243`:
+   ```
+   def valid_parameter_filter(module, key, value):
+       return isinstance(value, (dict, list, mx.array)) and not key.startswith("_")
+   def trainable_parameter_filter(module, key, value):
+       return Module.valid_parameter_filter(module, key, value) and key not in module._no_grad
+   ```
+   There is **no type distinction** between a weight and a state buffer — only
+   the `_` prefix and the `_no_grad` set. `Layer.states`/`decaytrace`/`embedtrace`
+   are plain `mx.array` attributes with no underscore and are never frozen in the
+   training path, so they **do** land in `trainable_parameters()`.
+
+   Consequence (`optimizers.py:109`): `apply_gradients` maps over `gradients`
+   (`tree_map(self.apply_single, gradients, parameters, self.state)`), so the
+   optimizer updates **every key present in grads**, including the trace buffers.
+   This runs *after* the loop's `layer.states = stop_gradient(states[i])`, so the
+   manually-set clean state is immediately clobbered by a small Adam perturbation
+   (~1.6e-3/step at lr=5e-4, b1=0.9, b2=0.999, bias correction off — systematic,
+   not noise). The plans previously guessed "almost certainly excluded"; that
+   guess was wrong.
+
+   **Decision needed before Phase A:** bug-for-bug (let the optimizer touch the
+   buffers, matching MLX numerically) vs. fix (register them as non-learnable
+   buffers, matching what the code appears to *intend*).

@@ -8,7 +8,7 @@ Tests are written BEFORE implementation (TDD). Implementation must satisfy.
 - forward(byte) -> shape (dim,)
 - forward(0) != forward(255) (different rows)
 - dtype float32
-- [VERIFY] init values match MLX scheme
+- init values match MLX scheme (normal, std=1/sqrt(dim)) — RESOLVED, see 01 #1
 
 ## tests/test_encoder.py
 - Encoder(byte) -> (dim,)
@@ -40,7 +40,7 @@ Tests are written BEFORE implementation (TDD). Implementation must satisfy.
 - L_pred = mean(square(x - tgt))
 - L_stop = mean(square(stop - (1.0 if end else 0.0)))
 - L_total = L_var + L_pred + L_ce + L_stop
-- [VERIFY] var ddof
+- var ddof = 0 (population) — RESOLVED, see 01 #4
 
 ## tests/test_sampling.py
 - softmax(output) sums to 1
@@ -51,8 +51,10 @@ Tests are written BEFORE implementation (TDD). Implementation must satisfy.
 ## tests/test_grad_hooks.py  (CRITICAL)
 - custom grads for encoder.embed.weight exist and are non-zero
 - custom grads for layer.decay exist and are non-zero
-- grads ADD to (or REPLACE) autodiff grads — [VERIFY] which
-- states/decaytrace/embedtrace NOT in trainable params — [VERIFY]
+- grads ADD to autodiff for embed.weight; REPLACE for decay — RESOLVED, see 01 #6
+- states/decaytrace/embedtrace ARE in trainable params (MLX filter has no
+  weight-vs-buffer distinction); optimizer update clobbers the just-set
+  stop_gradient state — RESOLVED, see 01 #7. Port must decide bug-for-bug vs fix.
 
 ## tests/test_checkpoint.py
 - save then load round-trips params, optimizer state, and all traces

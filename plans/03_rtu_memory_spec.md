@@ -48,10 +48,13 @@ The custom hooks inject gradients:
 
 dlds = dL/d(state_i) comes from autodiff through the residual stream.
 
-[VERIFY] Do the custom grads ADD to or REPLACE autodiff grads?
-[VERIFY] Are states/decaytrace/embedtrace in trainable_parameters()?
-        If yes, they'd be optimized by AdamW, which contradicts the
-        manual mutation. Almost certainly excluded.
+[RESOLVED] Asymmetric: embed.weight grads ADD to autodiff; decay grads REPLACE it.
+[RESOLVED] states/decaytrace/embedtrace ARE in trainable_parameters() — MLX's
+  filter (base.py:235-243) has no weight-vs-buffer distinction, only the `_`
+  prefix and `_no_grad` set. So they ARE optimized by AdamW, and the optimizer
+  update (optimizers.py:109 maps over `grads`) runs AFTER the loop's
+  stop_gradient assignment, clobbering the manually-set state by ~1.6e-3/step.
+  This is the opposite of the "almost certainly excluded" guess written above.
 
 ## Why this is the crux
 

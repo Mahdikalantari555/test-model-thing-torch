@@ -17,7 +17,7 @@ no aggressive refactoring. Preserve behavior first.
 | mx.sigmoid | torch.sigmoid |
 | mx.softmax | torch.softmax |
 | mx.logsumexp | torch.logsumexp |
-| mx.var | torch.var (ddof [VERIFY]) |
+| mx.var | torch.var(unbiased=False)  # MLX default ddof=0; PyTorch defaults to ddof=1 |
 | mx.mean | torch.mean |
 | mx.square | torch.square |
 | mx.maximum(0, ...) | torch.clamp(min=0) or torch.relu |

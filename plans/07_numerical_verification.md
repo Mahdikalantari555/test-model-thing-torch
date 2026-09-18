@@ -12,11 +12,12 @@ unavoidable and must be documented, not hidden:
    sampling, not training dynamics. Mitigation: fix torch seeds.
 
 2. Default dtypes / init. MLX Embedding/Linear init schemes differ from
-   PyTorch defaults. [VERIFY] the MLX schemes and match them, else the
-   first forward differs. This is the biggest controllable drift source.
+   PyTorch defaults. RESOLVED against source: Embedding is normal(std=1/√dim)
+   (must reinit); Linear is uniform(±1/√fan_in) (matches PyTorch's own default).
+   This is the biggest controllable drift source.
 
-3. var() convention. mx.var default ddof is [VERIFY]. If wrong, the
-   variance loss term scales differently and the whole loss curve shifts.
+3. var() convention. mx.var default ddof is 0 (population), RESOLVED. If wrong,
+   the variance loss term scales differently and the whole loss curve shifts.
 
 ## Verification plan
 
@@ -55,15 +56,25 @@ Must be close. The custom hook grads are the hardest to match.
 - Activations/losses/grads: relative tolerance 1e-3, documented per metric
 - Bit-exact: not claimed
 
-## [VERIFY] blocking items
+## [RESOLVED] blocking items
 
-These must be confirmed against the MLX runtime before verification can
-be trusted. If any is wrong, the comparison is invalid.
+All seven confirmed against the installed MLX 0.32.2 source (MLX cannot execute
+in this environment, so defaults were read from the package source, not run).
+Full citations in `01_source_analysis.md`.
 
-1. MLX Embedding init scheme
-2. MLX Linear init scheme
-3. MLX LayerNorm init (weight/bias, eps)
-4. mx.var ddof (population vs sample)
-5. Whether custom grads ADD to or REPLACE autodiff grads
-6. Whether states/decaytrace/embedtrace are in trainable_parameters()
-7. MLX AdamW bias correction and weight decay
+1. Embedding: **normal, std = 1/√dim**. Port must reinit.
+2. Linear: **uniform(±1/√fan_in)** — identical to PyTorch's own default. No reinit.
+3. LayerNorm: **eps=1e-5, affine=True, bias=True, weight=ones, bias=zeros** —
+   identical to PyTorch defaults.
+4. var: **ddof=0 (population)**. Port must use `torch.var(unbiased=False)`.
+5. Custom grads: **asymmetric** — embed.weight ADDS, decay REPLACES autodiff.
+6. states/decaytrace/embedtrace **ARE in trainable_parameters()** — MLX's filter
+   has no weight-vs-buffer distinction. They get Adam-updated, clobbering the
+   just-set stop_gradient state.
+7. AdamW: **weight_decay=0.01 (silent, repo never overrides it), bias_correction=False
+   (default)**. Port needs a custom step; stock `torch.optim.AdamW` always applies
+   bias correction.
+
+Caveat: items 1, 4, 6, 7 each introduce a real divergence from stock PyTorch
+defaults. Numerical similarity (relative 1e-3) is achievable only if the port
+matches these MLX defaults explicitly — see §Tolerance policy.
