@@ -3,6 +3,6 @@
   "dim": 384,
   "step_count": 21,
   "base_lr": 0.05,
-  "total_facts": 21,
-  "updated_at": 1790506064.1796148
+  "total_facts": 9,
+  "updated_at": 1790506526.9687564
 }

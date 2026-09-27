@@ -221,16 +221,17 @@ with tab_chat:
     if engine_mode.startswith("Droid"):
         st.caption("Tip: You can talk normally, teach concepts (e.g. 'learn: Remote sensing is...'), or ask questions.")
 
-    # Render conversation
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    chat_container = st.container()
+
+    # Render conversation above chat input
+    with chat_container:
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
     user_query = st.chat_input("Say something or teach your Droid...")
     if user_query:
         st.session_state.chat_history.append({"role": "user", "content": user_query})
-        with st.chat_message("user"):
-            st.markdown(user_query)
 
         if engine_mode.startswith("Droid"):
             # If auto-teach enabled and message looks like educational text/definition
@@ -240,7 +241,7 @@ with tab_chat:
                     response = f"✅ Absorbed {res['propositions']} facts into plastic memory (state norm: {res['memory_norm']:.2f}). You can now ask me about this domain!"
             else:
                 with st.spinner("Searching plastic memory..."):
-                    hits = active_droid.recall(user_query, top_k=3, threshold=0.48)
+                    hits = active_droid.recall(user_query, top_k=3, threshold=0.45)
                     context = " ".join([h["text"] for h in hits]) if hits else None
 
                     if st.session_state.llm_enabled and use_llm_synth:
@@ -254,8 +255,6 @@ with tab_chat:
                     else:
                         response = active_droid.chat(user_query)
 
-            with st.chat_message("assistant"):
-                st.markdown(response)
             st.session_state.chat_history.append({"role": "assistant", "content": response})
 
         else:
@@ -272,9 +271,9 @@ with tab_chat:
                     if stop > 0.35:
                         break
             final_text = bytes(out_bytes).decode("utf-8", errors="replace")
-            with st.chat_message("assistant"):
-                st.markdown(final_text)
             st.session_state.chat_history.append({"role": "assistant", "content": final_text})
+
+        st.rerun()
 
 # --- TAB 2: DOMAIN TEACHING & INGESTION ---
 with tab_teach:

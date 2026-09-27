@@ -81,6 +81,7 @@ class DroidEngine(nn.Module):
         self.step_count = 0
         self.logs: List[Dict[str, Any]] = []
         self.base_lr = 0.05
+        self.last_query: Optional[str] = None
 
     def log(self, message: str, level: str = "INFO", details: Optional[Dict[str, Any]] = None):
         entry = {
@@ -94,11 +95,36 @@ class DroidEngine(nn.Module):
             self.logs.pop(0)
 
     def _split_into_propositions(self, text: str) -> List[str]:
-        """Split text into coherent semantic facts/sentences."""
-        # Split on sentence boundaries, colons, or newlines
-        raw_parts = re.split(r'(?<=[.?!])\s+|\n+|(?:;\s+)', text.strip())
-        parts = [p.strip() for p in raw_parts if len(p.strip()) > 10]
-        return parts if parts else [text.strip()]
+        """Split text into coherent standalone semantic facts without truncating on abbreviations."""
+        # Protect common abbreviations and decimal numbers from premature splitting
+        protected = re.sub(r'\b(e\.g|i\.e|etc|vs|al|dr|mr|mrs|prof)\.', r'\1<DOT>', text.strip(), flags=re.IGNORECASE)
+        protected = re.sub(r'(\d+)\.(\d+)', r'\1<DOT>\2', protected)
+
+        raw_parts = re.split(r'(?<=[.?!])\s+|\n+|(?:;\s+)', protected)
+        cleaned = [p.replace('<DOT>', '.').strip() for p in raw_parts if p.strip()]
+
+        # Re-merge fragments if open parentheses or brackets exist
+        merged: List[str] = []
+        buffer = ""
+        for part in cleaned:
+            if buffer:
+                buffer += " " + part
+            else:
+                buffer = part
+
+            open_parens = buffer.count("(") - buffer.count(")")
+            open_brackets = buffer.count("[") - buffer.count("]")
+            if open_parens <= 0 and open_brackets <= 0 and len(buffer) > 10:
+                merged.append(buffer)
+                buffer = ""
+
+        if buffer:
+            if merged:
+                merged[-1] += " " + buffer
+            else:
+                merged.append(buffer)
+
+        return merged if merged else [text.strip()]
 
     def teach(self, text: str, source: str = "chat", auto_tune: bool = True) -> Dict[str, Any]:
         """
@@ -110,7 +136,30 @@ class DroidEngine(nn.Module):
 
         t0 = time.perf_counter()
         propositions = self._split_into_propositions(text)
-        self.log(f"Teaching {len(propositions)} propositions from '{source}'...", details={"source": source})
+
+        # Deduplicate against already-stored knowledge to prevent repeated facts
+        existing_facts = {f["text"].lower().strip() for f in self.knowledge_bank}
+        unique_propositions = []
+        for p in propositions:
+            clean_p = p.lower().strip()
+            if clean_p and clean_p not in existing_facts:
+                unique_propositions.append(p)
+                existing_facts.add(clean_p)
+
+        if not unique_propositions:
+            self.log("Knowledge already absorbed in memory, skipping duplicate storage.")
+            return {
+                "status": "already_known",
+                "propositions": 0,
+                "elapsed_ms": 0.0,
+                "avg_novelty": 0.0,
+                "memory_norm": float(torch.norm(self.memory.states).item()),
+                "effective_lr": self.base_lr,
+                "total_knowledge": len(self.knowledge_bank)
+            }
+
+        propositions = unique_propositions
+        self.log(f"Teaching {len(propositions)} new propositions from '{source}'...", details={"source": source})
 
         # 1. Semantic Embeddings via ONNX Anchor
         embs = self.anchor.embed(propositions)  # (N, 384)
@@ -214,6 +263,19 @@ class DroidEngine(nn.Module):
                     matches.append(entry)
             return matches
 
+    def _is_duplicate_or_subsumed(self, s1: str, s2: str) -> bool:
+        """Check if two sentences are near-duplicates or one is subsumed by the other."""
+        s1_c = re.sub(r'[^\w\s]', '', s1.lower()).strip()
+        s2_c = re.sub(r'[^\w\s]', '', s2.lower()).strip()
+        if s1_c == s2_c or s1_c in s2_c or s2_c in s1_c:
+            return True
+        w1 = set(s1_c.split())
+        w2 = set(s2_c.split())
+        if not w1 or not w2:
+            return False
+        overlap = len(w1 & w2) / max(len(w1), len(w2))
+        return overlap > 0.70
+
     def chat(self, user_message: str) -> str:
         """
         Conversational inference with factual memory synthesis.
@@ -228,23 +290,31 @@ class DroidEngine(nn.Module):
         if is_explicit_teach:
             teach_content = re.sub(r'^(learn|remember|note|teach):\s*', '', user_message, flags=re.IGNORECASE)
             res = self.teach(teach_content, source="chat")
-            return f"I have absorbed this into my memory ({res['propositions']} facts, memory norm: {res['memory_norm']:.2f}). You can now ask me about it!"
+            return f"I have absorbed this into my memory ({res['propositions']} new facts, memory norm: {res['memory_norm']:.2f}). You can now ask me about it!"
 
         # Query plastic memory with strict threshold
-        hits = self.recall(user_message, top_k=3, threshold=0.48)
-        
+        hits = self.recall(user_message, top_k=4, threshold=0.45)
+
+        # Contextual follow-up fallback: e.g. "explain complete", "what about RS", "tell me more"
+        if not hits and self.last_query:
+            contextual_query = f"{self.last_query} {user_message}"
+            hits = self.recall(contextual_query, top_k=4, threshold=0.40)
+            if hits:
+                self.log(f"Resolved follow-up query using previous context: '{self.last_query}'.")
+
         if hits:
-            # Construct coherent synthesis from learned facts
-            top_hit = hits[0]
-            other_hits = hits[1:]
+            # Update conversational focus
+            self.last_query = user_message
             
-            explanation_parts = [top_hit["text"]]
-            for h in other_hits:
-                if h["text"] not in explanation_parts:
-                    explanation_parts.append(h["text"])
+            # Construct coherent synthesis without repeating duplicated/subsumed facts
+            explanation_parts: List[str] = []
+            for h in hits:
+                t = h["text"].strip()
+                if not any(self._is_duplicate_or_subsumed(t, existing) for existing in explanation_parts):
+                    explanation_parts.append(t)
                     
             synthesized = " ".join(explanation_parts)
-            self.log(f"Factual recall hit with similarity {top_hit['similarity']:.3f}.")
+            self.log(f"Factual recall hit with similarity {hits[0]['similarity']:.3f}.")
             return f"{synthesized}"
 
         self.log("No relevant facts found above threshold.")

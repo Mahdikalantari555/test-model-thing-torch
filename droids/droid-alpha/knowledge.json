@@ -14,13 +14,6 @@
     "novelty": 0.5603303015232086
   },
   {
-    "text": "Remote sensing is used in numerous fields, including geophysics, geography, land surveying and most Earth science disciplines (e.g.",
-    "source": "webui_ingest",
-    "timestamp": 1790505685.7503626,
-    "step": 2,
-    "novelty": 0.29293662309646606
-  },
-  {
     "text": "exploration geophysics, hydrology, ecology, meteorology, oceanography, glaciology, geology).",
     "source": "webui_ingest",
     "timestamp": 1790505685.7503843,
@@ -96,5 +89,12 @@
     "timestamp": 1790505756.716377,
     "step": 13,
     "novelty": 0.6451832354068756
+  },
+  {
+    "text": "mimo is a harness",
+    "source": "webui_ingest",
+    "timestamp": 1790506504.9375176,
+    "step": 14,
+    "novelty": 1.0271265376359224
   }
 ]
