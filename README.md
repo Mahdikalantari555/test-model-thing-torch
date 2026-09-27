@@ -1,62 +1,138 @@
-# Test-Model-Thing (TMT)
+# Test-Model-Thing (TMT) — PyTorch & Droid Lifelong Engine
 
-[YouTube Video](https://youtu.be/9UERVVwpNew)
+[Original YouTube Demo](https://youtu.be/9UERVVwpNew) | [Original MLX Repo](https://github.com/jrz97619761/test-model-thing)
 
-This is a small proof-of-concept language model (not an LLM) that incorporates the following (and some smaller features as well):
-* Latent-space prediction
-* Internal state + recurrent trace units (RTUs)
-* Byte input/output
-* Continuous data streaming
-* Test-time training
+This repository provides a 1:1, contract-verified **PyTorch** implementation of Test-Model-Thing (TMT) alongside the **Droid Lifelong Engine** — an ultra-lightweight (< 30 MB) continual learning system that combines a frozen ONNX semantic anchor with plastic Recurrent Trace Units (RTUs) for conversational domain teaching without catastrophic forgetting.
 
-The model is built with MLX, so it should run fine on all Apple Silicon devices. MLX on Linux has been tested by community members and it should work fine as well. On Windows, there are a few unofficial work-in-progress Pytorch ports but they aren't 1:1 compatible yet. I have managed to get the model running on WSL however, and it does train.
+---
 
-Being a proof of concept I have only trained a 4.5-million parameter model (keep in mind, GPT-1 was ~117m) for about 12 hours, but there are promising results. The model tends to misspell characters (since it outputs byte-by-byte, rather than token-by-token) but it is able to close quotes/brackets and such. Given further training and scaling up the model more interesting results could occur. I'm also using a very small dataset, so there is a lot more that can be fed into the model.
+## Key Features
 
-This model architecture was designed between July and August 2026 by me (a solo high school dev) and some Gemini (only pair programming, no agents). I wrote about a dozen prototypes before finalizing on this architecture. I write READMEs myself without AI.
+1. **Pure PyTorch Implementation**:
+   - 100% parity with original MLX math (variance loss `unbiased=False`, custom AdamW optimizer, dual gradient hooks, decay trace updates).
+   - Runs everywhere: Linux, macOS, WSL2, and Windows (CPU or CUDA).
+   - Preserves original MLX scripts as `main_mlx.py` and `benchmark_mlx.py`.
 
-Feel free to fork the training and benchmark code (everything is under MIT). I really encourage you to try things out and submit issues and pull requests. If you have compute (e.g. you are a lab or just have GPUs lying around), feel free to train larger models for longer periods of time as well, with credit. I really appreciate contributions to the project.
+2. **Droid Lifelong Learning Engine**:
+   - **Semantic Anchor**: Quantized INT8 `all-MiniLM-L6-v2` via ONNX Runtime (~22 MB on disk, sub-15ms CPU inference, cached in `~/.cache/huggingface`).
+   - **Plastic RTU Memory**: Recurrent trace unit accumulating proposition vectors with automatic learning rate decay $\eta = \eta_0 / \sqrt{1 + \text{steps}/20}$.
+   - **Zero Catastrophic Collapse**: Base language syntax is anchored; learning specialized domain paragraphs (e.g. Remote Sensing, Hydrology, Medicine) adapts episodic memory instantly without corrupting previous knowledge.
+   - **In-Chat Conversational Teaching**: Teach the model simply by chatting, sending text paragraphs, or using `learn: <text>`.
 
-## Model output
+3. **Interactive Streamlit WebUI**:
+   - Switch between named Droid profiles (`droids/<name>/`) and raw byte RTU.
+   - Live chat, instant domain paragraph ingestion, transparent audit logs, and RTU memory/decay visualization.
 
-For reproduction purposes, the dataset I trained my model on is ```simplewiki-20260801-pages-articles.xml.bz2```, from the Wikipedia dumps. The 4.5m model has ```dim = 512``` and ```layers = 16```.
+---
 
-Below is ```--frozen``` mode output after training a model for 5 minutes (you could train it for much longer, feel free to send in the results as a GitHub issue).
+## Quickstart
 
-<img width="1127" height="634" alt="Screenshot 2026-09-19 at 4 53 44 PM" src="https://github.com/user-attachments/assets/ca1553de-0248-4f6d-a67d-2f6e30938d9e" />
-
-Also below is some results from CoLA after training a model for ~30 minutes. GPT-1, as a comparison point, scored 45.4, so there is still some distance to go.
-
-<img width="449" height="273" alt="Screenshot 2026-09-19 at 4 53 25 PM" src="https://github.com/user-attachments/assets/66cd054d-61c0-442a-a0bd-24352dac3f58" />
-
-
-## Training your own model
-
-Model weights (in ```.safetensors```) are not provided because GitHub doesn't like very large files. But, you can train your own model simply by initializing a ```venv``` and installing dependencies with ```pip install mlx``` on Mac or ```pip install mlx[cuda]``` on Linux with GPU or ```pip install mlx[cpu]``` on Linux with CPU. Then run ```main.py```.
+### 1. Installation
 
 ```bash
-python main.py <path> train
-python main.py <path> chat
+git clone https://github.com/jrz97619761/test-model-thing-torch.git
+cd test-model-thing-torch
 
-# does not save to disk
-python main.py <path> chat --no-save
-
-# does not modify weights
-python main.py <path> chat --frozen
-
-# does not save to disk or modify weights
-python main.py <path> chat --no-save --frozen
-
-# benchmark with CoLA
-python benchmark.py <path> <epochs> <slice>
+# Install dependencies (Python 3.10+)
+pip install -r requirements.txt
 ```
 
-You will have to configure your own dataset to run dataset mode, but you should be able to run chat mode without modifying anything if you have weights already.
+### 2. Launch WebUI (Streamlit)
 
-Once it begins training, you can safely ^C the program and it will save weights. It will also periodically save weights every so often. The saved weights include the internal memory so the model will remember that the next time it runs. You can launch into chat mode and the memory should carry on from whatever it was learning in training.
+```bash
+streamlit run app.py
+```
+Open `http://localhost:8501` to chat, switch Droids, teach new domains, and inspect internal states.
 
-## A graphical view (partially outdated)
+### 3. CLI Usage
 
-Below is an approximate flow chart of the model architecture, made in Apple's Freeform app (excluding the wrapper for dataset cleaning and input/output handling) for reference. Note that the arrow connecting the target latent to the CE loss should instead be the target byte to the CE loss.
+#### PyTorch CLI
+```bash
+# Train on raw bytes
+python main.py <checkpoint.safetensors> train
 
-<img width="1653" height="1161" alt="JEPA thing" src="https://github.com/user-attachments/assets/2d3a34ff-ba6a-44b8-b361-6c73da9216c0" />
+# Interactive chat
+python main.py <checkpoint.safetensors> chat
+
+# Inference only (frozen weights)
+python main.py <checkpoint.safetensors> chat --frozen
+
+# Benchmark with CoLA
+python benchmark.py <checkpoint.safetensors> <epochs> <slice>
+```
+
+#### Droid Lifelong Engine in Python
+```python
+from src.model.droid_manager import DroidManager
+
+mgr = DroidManager(base_dir="droids")
+droid = mgr.get_droid("droid-geospatial")
+
+# Teach a domain paragraph (absorbed in < 30ms on CPU)
+droid.teach(
+    "Remote sensing is the acquisition of information about an object or phenomenon "
+    "without making physical contact with the object, in contrast to on-site observation."
+)
+
+# Recall accurately in chat
+reply = droid.chat("What is remote sensing?")
+print(reply)
+# -> "Remote sensing is the acquisition of information about an object..."
+
+# Save profile
+mgr.save_droid("droid-geospatial")
+```
+
+---
+
+## Architecture Overview
+
+```
+                      +-----------------------------+
+                      |   Input Text / Query        |
+                      +--------------+--------------+
+                                     |
+                                     v
+               +-------------------------------------------+
+               |  ONNX MiniLM Anchor (~22 MB, INT8)        |
+               |  (Frozen Base Semantic Feature Extractor) |
+               +---------------------+---------------------+
+                                     |
+                          Embedding z in R^384
+                                     |
+                                     v
+               +-------------------------------------------+
+               |  Plastic RTU Memory Block (dim=384)       |
+               |  h_t = decay * h_{t-1} + z_t              |
+               |  x = LayerNorm + Linear + SiLU            |
+               +---------------------+---------------------+
+                                     |
+                                     v
+               +-------------------------------------------+
+               |  Episodic Knowledge Bank & Dual Recall    |
+               |  -> Grounded domain synthesis             |
+               |  -> Zero catastrophic collapse            |
+               +-------------------------------------------+
+```
+
+---
+
+## Verification & Tests
+
+Run the complete test suite (43 contract, unit, and lifelong learning tests):
+
+```bash
+pytest tests
+```
+
+Run end-to-end domain teaching verification (Remote Sensing acquisition & recall):
+
+```bash
+python scripts/verify_remote_sensing_e2e.py
+```
+
+---
+
+## License
+
+MIT

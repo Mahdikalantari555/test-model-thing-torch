@@ -1,1 +1,9 @@
-mlx
+torch>=2.0.0
+safetensors>=0.4.0
+onnxruntime>=1.16.0
+onnx>=1.15.0
+transformers>=4.38.0
+huggingface_hub>=0.20.0
+pytest>=8.0.0
+streamlit>=1.30.0
+pandas>=2.0.0

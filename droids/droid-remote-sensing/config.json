@@ -1,0 +1,8 @@
+{
+  "name": "droid-remote-sensing",
+  "dim": 384,
+  "step_count": 16,
+  "base_lr": 0.05,
+  "total_facts": 16,
+  "updated_at": 1790505435.7603161
+}
