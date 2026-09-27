@@ -10,8 +10,9 @@ import pandas as pd
 from src.model.rtu import Model
 from src.model.droid import DroidEngine
 from src.model.droid_manager import DroidManager
+from src.model.teacher import OpenAITeacher
 
-# ponytail: Unified Streamlit WebUI supporting both Droid Lifelong Engine and Raw RTU.
+# ponytail: Unified Streamlit WebUI supporting Droid Lifelong Engine, Raw RTU, and LLM Provider.
 
 st.set_page_config(page_title="TMT Droid Studio", page_icon="🤖", layout="wide")
 
@@ -32,6 +33,18 @@ if "selected_droid_name" not in st.session_state:
 
 # Active droid
 active_droid: DroidEngine = droid_mgr.get_droid(st.session_state.selected_droid_name)
+
+# LLM Provider configuration state
+if "llm_enabled" not in st.session_state:
+    st.session_state.llm_enabled = False
+if "llm_base_url" not in st.session_state:
+    st.session_state.llm_base_url = "http://localhost:11434/v1"
+if "llm_api_key" not in st.session_state:
+    st.session_state.llm_api_key = "EMPTY"
+if "llm_model" not in st.session_state:
+    st.session_state.llm_model = "llama3:latest"
+if "llm_preset" not in st.session_state:
+    st.session_state.llm_preset = "Ollama (localhost:11434)"
 
 # Session state for chat & training
 if "chat_history" not in st.session_state:
@@ -91,6 +104,78 @@ with st.sidebar:
         st.success("🟢 ONNX MiniLM (INT8, 22MB) Active")
         st.caption("Cached in `~/.cache/huggingface` (Zero GPU RAM, sub-15ms CPU).")
 
+        st.divider()
+        st.subheader("🌐 LLM Provider (Teacher & Synthesis)")
+        llm_on = st.checkbox("Enable External LLM Provider", value=st.session_state.llm_enabled)
+        st.session_state.llm_enabled = llm_on
+
+        if llm_on:
+            presets = {
+                "Ollama (localhost:11434)": {
+                    "base_url": "http://localhost:11434/v1",
+                    "model": "llama3:latest",
+                    "api_key": "EMPTY"
+                },
+                "LM Studio (localhost:1234)": {
+                    "base_url": "http://localhost:1234/v1",
+                    "model": "local-model",
+                    "api_key": "EMPTY"
+                },
+                "Groq": {
+                    "base_url": "https://api.groq.com/openai/v1",
+                    "model": "llama-3.3-70b-versatile",
+                    "api_key": ""
+                },
+                "OpenRouter": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "meta-llama/llama-3-8b-instruct",
+                    "api_key": ""
+                },
+                "OpenAI": {
+                    "base_url": "https://api.openai.com/v1",
+                    "model": "gpt-4o-mini",
+                    "api_key": ""
+                },
+                "Custom": {
+                    "base_url": st.session_state.llm_base_url,
+                    "model": st.session_state.llm_model,
+                    "api_key": st.session_state.llm_api_key
+                }
+            }
+
+            preset_choice = st.selectbox(
+                "Provider Preset",
+                list(presets.keys()),
+                index=list(presets.keys()).index(st.session_state.llm_preset) if st.session_state.llm_preset in presets else 0
+            )
+
+            if preset_choice != st.session_state.llm_preset:
+                st.session_state.llm_preset = preset_choice
+                if preset_choice != "Custom":
+                    st.session_state.llm_base_url = presets[preset_choice]["base_url"]
+                    st.session_state.llm_model = presets[preset_choice]["model"]
+                    if presets[preset_choice]["api_key"]:
+                        st.session_state.llm_api_key = presets[preset_choice]["api_key"]
+                st.rerun()
+
+            st.session_state.llm_base_url = st.text_input("Base URL", value=st.session_state.llm_base_url)
+            st.session_state.llm_model = st.text_input("Model Name", value=st.session_state.llm_model)
+            st.session_state.llm_api_key = st.text_input("API Key", value=st.session_state.llm_api_key, type="password")
+
+            if st.button("🧪 Test LLM Connection"):
+                with st.spinner("Pinging LLM provider..."):
+                    t = OpenAITeacher(
+                        base_url=st.session_state.llm_base_url,
+                        api_key=st.session_state.llm_api_key,
+                        model=st.session_state.llm_model
+                    )
+                    ok, msg = t.test_connection(timeout=5.0)
+                    if ok:
+                        st.success(f"✅ {msg}")
+                    else:
+                        st.error(f"❌ {msg}")
+
+        st.divider()
         col_save, col_reset = st.columns(2)
         if col_save.button("💾 Save Droid"):
             droid_mgr.save_droid(st.session_state.selected_droid_name)
@@ -129,6 +214,10 @@ with tab_chat:
 
     col_opt1, col_opt2 = st.columns([2, 1])
     auto_teach = col_opt1.checkbox("Auto-learn new facts directly from chat", value=True)
+    use_llm_synth = False
+    if st.session_state.llm_enabled:
+        use_llm_synth = col_opt2.checkbox("Synthesize reply with LLM Provider", value=True)
+
     if engine_mode.startswith("Droid"):
         st.caption("Tip: You can talk normally, teach concepts (e.g. 'learn: Remote sensing is...'), or ask questions.")
 
@@ -150,8 +239,20 @@ with tab_chat:
                     res = active_droid.teach(user_query, source="chat")
                     response = f"✅ Absorbed {res['propositions']} facts into plastic memory (state norm: {res['memory_norm']:.2f}). You can now ask me about this domain!"
             else:
-                with st.spinner("Recalling from plastic memory..."):
-                    response = active_droid.chat(user_query)
+                with st.spinner("Searching plastic memory..."):
+                    hits = active_droid.recall(user_query, top_k=3, threshold=0.48)
+                    context = " ".join([h["text"] for h in hits]) if hits else None
+
+                    if st.session_state.llm_enabled and use_llm_synth:
+                        with st.spinner(f"Synthesizing response via {st.session_state.llm_model}..."):
+                            teacher = OpenAITeacher(
+                                base_url=st.session_state.llm_base_url,
+                                api_key=st.session_state.llm_api_key,
+                                model=st.session_state.llm_model
+                            )
+                            response = teacher.synthesize_answer(user_query, context=context)
+                    else:
+                        response = active_droid.chat(user_query)
 
             with st.chat_message("assistant"):
                 st.markdown(response)
@@ -202,11 +303,26 @@ with tab_teach:
     col_btn, col_info = st.columns([1, 2])
     with col_btn:
         start_teach = st.button("🚀 Teach Droid Instantly", type="primary")
+    with col_info:
+        use_llm_distill = False
+        if st.session_state.llm_enabled:
+            use_llm_distill = st.checkbox("Distill text with LLM Teacher before learning", value=True)
 
     if start_teach and teach_text.strip():
         if engine_mode.startswith("Droid"):
             with st.spinner("Processing propositions & updating plastic RTU memory..."):
-                result = active_droid.teach(teach_text, source="webui_ingest", auto_tune=True)
+                if st.session_state.llm_enabled and use_llm_distill:
+                    teacher = OpenAITeacher(
+                        base_url=st.session_state.llm_base_url,
+                        api_key=st.session_state.llm_api_key,
+                        model=st.session_state.llm_model
+                    )
+                    distilled = teacher.distill_propositions(teach_text)
+                    text_to_teach = "\n".join(distilled)
+                else:
+                    text_to_teach = teach_text
+
+                result = active_droid.teach(text_to_teach, source="webui_ingest", auto_tune=True)
                 droid_mgr.save_droid(st.session_state.selected_droid_name)
 
             st.success(

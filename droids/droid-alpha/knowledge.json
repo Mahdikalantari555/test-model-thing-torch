@@ -1,1 +1,100 @@
-[]
+[
+  {
+    "text": "Remote sensing is the acquisition of information about an object or phenomenon without making physical contact with the object, in contrast to on-site observation.",
+    "source": "webui_ingest",
+    "timestamp": 1790505685.750137,
+    "step": 0,
+    "novelty": 1.0
+  },
+  {
+    "text": "The term is applied especially to acquiring information about Earth and other planets.",
+    "source": "webui_ingest",
+    "timestamp": 1790505685.7503169,
+    "step": 1,
+    "novelty": 0.5603303015232086
+  },
+  {
+    "text": "Remote sensing is used in numerous fields, including geophysics, geography, land surveying and most Earth science disciplines (e.g.",
+    "source": "webui_ingest",
+    "timestamp": 1790505685.7503626,
+    "step": 2,
+    "novelty": 0.29293662309646606
+  },
+  {
+    "text": "exploration geophysics, hydrology, ecology, meteorology, oceanography, glaciology, geology).",
+    "source": "webui_ingest",
+    "timestamp": 1790505685.7503843,
+    "step": 3,
+    "novelty": 0.5691185593605042
+  },
+  {
+    "text": "It also has military, intelligence, commercial, economic, planning, and humanitarian applications.",
+    "source": "webui_ingest",
+    "timestamp": 1790505685.7504058,
+    "step": 4,
+    "novelty": 0.6391577124595642
+  },
+  {
+    "text": "mote Sensing (RS) is a crucial technology for observing, monitoring, and interpreting our planet, with broad applications across geoscience, economics, humanitarian fields, etc.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.7162082,
+    "step": 5,
+    "novelty": 0.5800610780715942
+  },
+  {
+    "text": "While artificial intelligence (AI), particularly deep learning, has achieved significant advances in RS, unique challenges persist in developing more intelligent RS systems, including the complexity of Earth's environments, diverse sensor modalities, distinctive feature patterns, varying spatial and spectral resolutions, and temporal dynamics.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.7162447,
+    "step": 6,
+    "novelty": 0.5467385649681091
+  },
+  {
+    "text": "Meanwhile, recent breakthroughs in large Foundation Models (FMs) have expanded AI's potential across many domains due to their exceptional generalizability and zero-shot transfer capabilities.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.716267,
+    "step": 7,
+    "novelty": 0.7641520649194717
+  },
+  {
+    "text": "However, their success has largely been confined to natural data like images and video, with degraded performance and even failures for RS data of various non-optical modalities.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.7162857,
+    "step": 8,
+    "novelty": 0.5745649337768555
+  },
+  {
+    "text": "This has inspired growing interest in developing Remote Sensing Foundation Models (RSFMs) to address the complex demands of Earth Observation (EO) tasks, spanning the surface, atmosphere, and oceans.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.7163053,
+    "step": 9,
+    "novelty": 0.4493635296821594
+  },
+  {
+    "text": "This survey systematically reviews the emerging field of RSFMs.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.716323,
+    "step": 10,
+    "novelty": 0.5933651030063629
+  },
+  {
+    "text": "It begins with an outline of their motivation and background, followed by an introduction of their foundational concepts.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.7163417,
+    "step": 11,
+    "novelty": 0.8029227554798126
+  },
+  {
+    "text": "It then categorizes and reviews existing RSFM studies including their datasets and technical contributions across Visual Foundation Models (VFMs), Visual-Language Models (VLMs), Large Language Models (LLMs), and beyond.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.71636,
+    "step": 12,
+    "novelty": 0.4901324510574341
+  },
+  {
+    "text": "In addition, we benchmark these models against publicly available datasets, discuss existing challenges, and propose future research directions in this rapidly evolving field.",
+    "source": "webui_ingest",
+    "timestamp": 1790505756.716377,
+    "step": 13,
+    "novelty": 0.6451832354068756
+  }
+]

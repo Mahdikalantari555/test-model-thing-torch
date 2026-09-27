@@ -282,5 +282,45 @@
     "level": "INFO",
     "message": "Factual recall hit with similarity 0.834.",
     "details": {}
+  },
+  {
+    "timestamp": "14:17:11",
+    "level": "INFO",
+    "message": "Profile loaded from droids/droid-remote-sensing",
+    "details": {}
+  },
+  {
+    "timestamp": "14:17:14",
+    "level": "INFO",
+    "message": "Chat received: 'you know what is astrophisycs?\n\n'",
+    "details": {}
+  },
+  {
+    "timestamp": "14:17:14",
+    "level": "INFO",
+    "message": "No relevant facts found above threshold.",
+    "details": {}
+  },
+  {
+    "timestamp": "14:17:44",
+    "level": "INFO",
+    "message": "Teaching 5 propositions from 'webui_ingest'...",
+    "details": {
+      "source": "webui_ingest"
+    }
+  },
+  {
+    "timestamp": "14:17:44",
+    "level": "INFO",
+    "message": "Successfully learned 5 facts in 17.1ms. State norm: 7.83.",
+    "details": {
+      "status": "learned",
+      "propositions": 5,
+      "elapsed_ms": 17.06016699972679,
+      "avg_novelty": 0.4485282778739929,
+      "memory_norm": 7.831624507904053,
+      "effective_lr": 0.037267799624996496,
+      "total_knowledge": 21
+    }
   }
 ]

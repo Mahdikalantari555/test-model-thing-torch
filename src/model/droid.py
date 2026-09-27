@@ -187,21 +187,21 @@ class DroidEngine(nn.Module):
         )
         return result
 
-    def recall(self, query: str, top_k: int = 3, threshold: float = 0.35) -> List[Dict[str, Any]]:
-        """Retrieve most relevant learned facts using RTU memory-conditioned matching."""
+    def recall(self, query: str, top_k: int = 3, threshold: float = 0.50) -> List[Dict[str, Any]]:
+        """Retrieve most relevant learned facts using pure semantic matching."""
         if not self.knowledge_bank or self.knowledge_vectors is None:
             return []
 
         q_emb = self.anchor.embed(query)  # (384,)
+        if q_emb.dim() > 1:
+            q_emb = q_emb.squeeze(0)
+        q_emb = q_emb / torch.norm(q_emb).clamp(min=1e-6)
         
-        # Query conditioned by RTU memory state
         with torch.no_grad():
-            decay = torch.sigmoid(self.memory.decay)
-            conditioned_q = (0.7 * q_emb) + (0.3 * (self.memory.states / max(1e-6, self.memory.states.norm())))
-            conditioned_q = conditioned_q / torch.norm(conditioned_q)
-
-            # Compute similarities with knowledge vectors
-            sims = torch.mv(self.knowledge_vectors, conditioned_q)
+            # Match directly against normalized knowledge vectors
+            kv_norms = torch.norm(self.knowledge_vectors, p=2, dim=1, keepdim=True).clamp(min=1e-6)
+            normed_kv = self.knowledge_vectors / kv_norms
+            sims = torch.mv(normed_kv, q_emb)
             
             top_vals, top_indices = torch.topk(sims, k=min(top_k, len(self.knowledge_bank)))
             
@@ -230,8 +230,8 @@ class DroidEngine(nn.Module):
             res = self.teach(teach_content, source="chat")
             return f"I have absorbed this into my memory ({res['propositions']} facts, memory norm: {res['memory_norm']:.2f}). You can now ask me about it!"
 
-        # Query plastic memory
-        hits = self.recall(user_message, top_k=3, threshold=0.32)
+        # Query plastic memory with strict threshold
+        hits = self.recall(user_message, top_k=3, threshold=0.48)
         
         if hits:
             # Construct coherent synthesis from learned facts
@@ -246,6 +246,9 @@ class DroidEngine(nn.Module):
             synthesized = " ".join(explanation_parts)
             self.log(f"Factual recall hit with similarity {top_hit['similarity']:.3f}.")
             return f"{synthesized}"
+
+        self.log("No relevant facts found above threshold.")
+        return "I do not have information about this topic in my memory yet. Teach me by saying: 'learn: <facts>'."
 
         # If no specific knowledge matches, respond gracefully
         if len(self.knowledge_bank) > 0:
