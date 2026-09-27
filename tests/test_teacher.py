@@ -16,5 +16,6 @@ def test_teacher_connection_test_fallback():
 
 def test_teacher_synthesize_answer_fallback():
     teacher = OpenAITeacher(base_url="http://127.0.0.1:9999/v1", api_key="test")
-    ans = teacher.synthesize_answer("What is RS?", context="Remote sensing is observing.", timeout=0.5)
+    ans, meta = teacher.synthesize_answer("What is RS?", context="Remote sensing is observing.", timeout=0.5)
     assert "Remote sensing is observing." in ans
+    assert meta["source"] == "plastic_memory_only"

@@ -228,20 +228,37 @@ with tab_chat:
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                if msg.get("source_label"):
+                    st.caption(f"🏷️ **Source**: {msg['source_label']}")
+                if msg.get("facts_recalled"):
+                    with st.expander(f"🔍 View {len(msg['facts_recalled'])} Recalled Facts from Plastic Memory"):
+                        for idx, f in enumerate(msg["facts_recalled"]):
+                            score = f.get("similarity", 0.0)
+                            st.markdown(f"**{idx+1}.** {f['text']} *(match score: `{score:.3f}`)*")
 
     user_query = st.chat_input("Say something or teach your Droid...")
     if user_query:
         st.session_state.chat_history.append({"role": "user", "content": user_query})
 
         if engine_mode.startswith("Droid"):
+            source_label = ""
+            facts_recalled = []
+
             # If auto-teach enabled and message looks like educational text/definition
             if auto_teach and len(user_query) > 50 and not user_query.strip().endswith("?"):
                 with st.spinner("Absorbing knowledge into plastic memory..."):
                     res = active_droid.teach(user_query, source="chat")
                     response = f"✅ Absorbed {res['propositions']} facts into plastic memory (state norm: {res['memory_norm']:.2f}). You can now ask me about this domain!"
+                    source_label = f"🧠 Plastic Memory (Live conversational absorption of {res['propositions']} facts)"
             else:
                 with st.spinner("Searching plastic memory..."):
-                    hits = active_droid.recall(user_query, top_k=3, threshold=0.45)
+                    hits = active_droid.recall(user_query, top_k=4, threshold=0.45)
+                    # Contextual follow-up fallback: e.g. "explain complete", "what about RS"
+                    if not hits and active_droid.last_query:
+                        contextual_query = f"{active_droid.last_query} {user_query}"
+                        hits = active_droid.recall(contextual_query, top_k=4, threshold=0.40)
+
+                    facts_recalled = hits
                     context = " ".join([h["text"] for h in hits]) if hits else None
 
                     if st.session_state.llm_enabled and use_llm_synth:
@@ -251,11 +268,31 @@ with tab_chat:
                                 api_key=st.session_state.llm_api_key,
                                 model=st.session_state.llm_model
                             )
-                            response = teacher.synthesize_answer(user_query, context=context)
+                            response, meta = teacher.synthesize_answer(
+                                user_query,
+                                context=context,
+                                droid_name=st.session_state.selected_droid_name
+                            )
+                            if meta.get("source") == "llm_grounded_memory":
+                                max_score = hits[0]["similarity"] if hits else 0.0
+                                source_label = f"🌐 LLM ({st.session_state.llm_model}) + 🧠 Grounded in {len(hits)} Droid Facts (top match: {max_score:.2f})"
+                            elif meta.get("source") == "llm_general_knowledge":
+                                source_label = f"🌐 LLM ({st.session_state.llm_model}) [General Knowledge — No Droid facts matched]"
+                            else:
+                                source_label = "🧠 Plastic Memory (Direct recall — LLM call failed)"
                     else:
                         response = active_droid.chat(user_query)
+                        if hits:
+                            source_label = f"🧠 Plastic Droid Memory ({len(hits)} facts recalled, top match: {hits[0]['similarity']:.2f})"
+                        else:
+                            source_label = "🧠 Plastic Droid Memory [No relevant facts found in memory]"
 
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": response,
+                "source_label": source_label,
+                "facts_recalled": facts_recalled
+            })
 
         else:
             # Raw byte RTU inference
@@ -271,7 +308,11 @@ with tab_chat:
                     if stop > 0.35:
                         break
             final_text = bytes(out_bytes).decode("utf-8", errors="replace")
-            st.session_state.chat_history.append({"role": "assistant", "content": final_text})
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": final_text,
+                "source_label": f"⚙️ Raw Byte RTU Model (dim={raw_model.dim}, layers={raw_model.layers})"
+            })
 
         st.rerun()
 
@@ -280,7 +321,7 @@ with tab_teach:
     st.subheader("Teach Specific Domain Knowledge")
     st.markdown("Paste any domain text, article, or definition. Parameters and learning rate are **automatically selected** to guarantee zero collapse.")
 
-    uploaded_file = st.file_uploader("Upload Text File (.txt)", type=["txt"])
+    uploaded_file = st.file_uploader("Upload Markdown Document (.md)", type=["md"])
     file_content = uploaded_file.read().decode("utf-8", errors="ignore") if uploaded_file else ""
 
     sample_remote_sensing = (

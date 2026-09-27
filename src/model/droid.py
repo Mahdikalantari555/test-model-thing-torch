@@ -95,9 +95,21 @@ class DroidEngine(nn.Module):
             self.logs.pop(0)
 
     def _split_into_propositions(self, text: str) -> List[str]:
-        """Split text into coherent standalone semantic facts without truncating on abbreviations."""
+        """Split Markdown/text into coherent standalone semantic facts without truncating on abbreviations."""
+        # Strip markdown syntax: [anchor](url) -> anchor, remove bold/italic/code markers
+        cleaned_md = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text.strip())
+        cleaned_md = re.sub(r'[*_`]', '', cleaned_md)
+
+        # Strip line prefixes (headers #, blockquotes >, list bullets -, *)
+        lines = []
+        for line in cleaned_md.splitlines():
+            clean_line = re.sub(r'^[#*>\-\d.]+\s+', '', line).strip()
+            if clean_line:
+                lines.append(clean_line)
+        cleaned_text = "\n".join(lines) if lines else text.strip()
+
         # Protect common abbreviations and decimal numbers from premature splitting
-        protected = re.sub(r'\b(e\.g|i\.e|etc|vs|al|dr|mr|mrs|prof)\.', r'\1<DOT>', text.strip(), flags=re.IGNORECASE)
+        protected = re.sub(r'\b(e\.g|i\.e|etc|vs|al|dr|mr|mrs|prof)\.', r'\1<DOT>', cleaned_text, flags=re.IGNORECASE)
         protected = re.sub(r'(\d+)\.(\d+)', r'\1<DOT>\2', protected)
 
         raw_parts = re.split(r'(?<=[.?!])\s+|\n+|(?:;\s+)', protected)

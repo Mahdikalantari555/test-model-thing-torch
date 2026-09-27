@@ -86,16 +86,25 @@ class OpenAITeacher:
             # Fallback to local splitting if endpoint is unreachable
             return [raw_text]
 
-    def synthesize_answer(self, query: str, context: Optional[str] = None, timeout: float = 20.0) -> str:
-        """Synthesize fluent answer given query and retrieved Droid plastic memory context."""
+    def synthesize_answer(self, query: str, context: Optional[str] = None, droid_name: str = "Droid", timeout: float = 45.0) -> tuple[str, Dict[str, Any]]:
+        """
+        Synthesize answer given query and retrieved Droid plastic memory context.
+        Returns (response_text, provenance_metadata).
+        """
         if context:
             system_prompt = (
-                "You are an intelligent assistant. Use the following verified memory facts "
-                "from your plastic memory bank as ground truth to answer the user query.\n\n"
-                f"Memory Context:\n{context}"
+                f"You are the voice and synthesis layer for {droid_name}, an AI with plastic on-device RTU memory. "
+                "Base your answer strictly on the following verified facts retrieved from plastic memory. "
+                "Do not state that you are ChatGPT or OpenAI; you are speaking on behalf of this Droid.\n\n"
+                f"Verified Plastic Memory:\n{context}"
             )
+            mode = "llm_grounded_memory"
         else:
-            system_prompt = "You are a helpful and knowledgeable assistant."
+            system_prompt = (
+                f"You are {droid_name}, an AI assistant. Answer the user question accurately and concisely. "
+                "When asked who you are, identify as this Droid assistant backed by your configured model."
+            )
+            mode = "llm_general_knowledge"
 
         payload = {
             "model": self.model,
@@ -118,8 +127,19 @@ class OpenAITeacher:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
-                return result["choices"][0]["message"]["content"]
+                text = result["choices"][0]["message"]["content"]
+                meta = {
+                    "source": mode,
+                    "provider_model": self.model,
+                    "endpoint": self.base_url,
+                    "has_context": bool(context)
+                }
+                return text, meta
         except Exception as e:
             if context:
-                return f"{context}\n\n(Note: LLM provider unavailable: {e})"
-            return f"I do not have information on this topic and LLM provider is unavailable: {e}"
+                text = f"{context}\n\n*(Note: LLM provider call failed: {e})*"
+                meta = {"source": "plastic_memory_only", "error": str(e)}
+                return text, meta
+            text = f"I do not have information on this topic and external LLM provider is unavailable ({e})."
+            meta = {"source": "unanswered", "error": str(e)}
+            return text, meta
