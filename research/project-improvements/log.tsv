@@ -1,0 +1,8 @@
+timestamp	angle	status	summary
+2026-09-27T14:15:00Z	A0-baseline	completed	Established baseline architecture, identified 5 core engineering bottlenecks and product gaps.
+2026-09-27T15:30:00Z	A6-remote-sensing	completed	Investigated Clay, Prithvi, SatMAE, lightweight MobileNetV4/TinyViT multi-spectral INT8 encoders, and formulated dual-memory multimodal integration for TMT Droid.
+2026-09-27T16:00:00Z	A4-system1-decision	completed	Designed non-autoregressive System-1 decision head, prototype routing, calibrated entropy gating, and tool-calling engine for Droid (< 3ms CPU latency, < 100KB head).
+2026-09-27T16:30:00Z	A2-plastic-memory	completed	Researched Titans, RWKV-7 Goose, predictive coding surprise gating, Ebbinghaus forgetting, and formulated zero-pollution retrieval and sleep consolidation specs.
+2026-09-27T16:30:00Z	A3-propositions-tms	completed	Investigated Dense X Retrieval, rolling anaphora resolution, AGM belief revision, SVO dual representation, and two-tier edge contradiction detection.
+2026-09-27T17:00:00Z	A1-edge-retrieval	completed	Researched SQLite-vec, FTS5 BM25, HNSW tradeoffs, and designed sub-3ms RRF hybrid KnowledgeStore using < 15MB RAM.
+2026-09-27T17:00:00Z	A5-product-surface	completed	Designed zero-dependency stdio MCP server, unified headless CLI (chat/teach/decide/serve/package), dual-mode REST daemon, and portable .droid bundle format.
