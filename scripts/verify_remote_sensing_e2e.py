@@ -14,6 +14,9 @@ def run_verification():
     mgr = DroidManager(base_dir="droids")
     droid_name = "droid-remote-sensing"
     droid = mgr.get_droid(droid_name)
+    # idempotent re-runs: start from a clean knowledge slate
+    droid.clear_knowledge()
+    droid.step_count = 0
     
     user_paragraph = (
         "Remote sensing is the acquisition of information about an object or phenomenon "

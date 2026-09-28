@@ -182,8 +182,7 @@ with st.sidebar:
             st.success(f"Saved {st.session_state.selected_droid_name}")
         if col_reset.button("🔄 Reset Memory"):
             active_droid.memory.reset()
-            active_droid.knowledge_bank.clear()
-            active_droid.knowledge_vectors = None
+            active_droid.clear_knowledge()
             active_droid.step_count = 0
             droid_mgr.save_droid(st.session_state.selected_droid_name)
             st.warning("Memory reset to zero.")

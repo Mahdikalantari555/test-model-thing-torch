@@ -22,3 +22,26 @@ The system SHALL automatically determine the learning rate, decay half-life, and
 #### Scenario: Auto-scaled update
 - **WHEN** a text of arbitrary length $N$ is provided for conversational teaching
 - **THEN** the system SHALL apply an effective learning rate scaled by $1 / \sqrt{N}$ and log the chosen values
+
+### Requirement: Rolling Discourse Anaphora Resolution
+The system SHALL resolve third-person pronouns (it, they, this, these) to their active discourse antecedents during paragraph ingestion so that split propositions remain self-contained.
+
+#### Scenario: Pronoun anchoring in markdown
+- **WHEN** user teaches a multi-sentence markdown paragraph where sentence 2 begins with "It"
+- **THEN** the system SHALL replace "It" in the split proposition with the active subject from sentence 1
+- **THEN** the resulting proposition SHALL be self-contained and semantically complete
+
+#### Scenario: Multi-paragraph context carryover
+- **WHEN** user teaches paragraph A ending with subject "Remote sensing"
+- **WHEN** user teaches paragraph B beginning with "It uses"
+- **THEN** the system SHALL carry over the last active subject across paragraph boundaries
+- **THEN** paragraph B's proposition SHALL contain the resolved antecedent
+
+### Requirement: Truth Maintenance Metadata on Facts
+The system SHALL attach truth maintenance metadata (`superseded`, `valid_until`, `superseded_by`) to every stored fact during ingestion.
+
+#### Scenario: Metadata attached on teach
+- **WHEN** a fact is taught
+- **THEN** the stored fact record SHALL include `superseded: false`, `valid_until: null`, and `superseded_by: null` fields
+- **WHEN** a fact is superseded by a later contradiction
+- **THEN** the stored fact record SHALL update `superseded: true`, `valid_until: <timestamp>`, and `superseded_by: <fact_id>`

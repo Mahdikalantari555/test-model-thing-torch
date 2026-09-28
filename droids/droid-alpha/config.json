@@ -1,8 +1,0 @@
-{
-  "name": "droid-alpha",
-  "dim": 384,
-  "step_count": 15,
-  "base_lr": 0.05,
-  "total_facts": 14,
-  "updated_at": 1790506525.4220378
-}

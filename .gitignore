@@ -8,3 +8,5 @@
 *.pipe
 *.DS_Store
 *.safetensors
+# Runtime droid profiles (generated state)
+/droids/

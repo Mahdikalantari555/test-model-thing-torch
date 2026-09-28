@@ -10,8 +10,155 @@ import torch.nn as nn
 from safetensors.torch import save_file, load_file
 
 from src.model.onnx_anchor import OnnxMiniLM
+from src.model.knowledge_store import KnowledgeStore
 
 # ponytail: DroidEngine binds 22MB ONNX MiniLM semantic anchor to plastic RTU memory.
+
+# ---------------------------------------------------------------------------
+# Zero-dependency discourse / TMS helpers (Decision 3 & 4 in design.md)
+# ---------------------------------------------------------------------------
+_ANAPHORA_RE = re.compile(r"^(It|They|This|These|Those)\b")
+
+# Function-predicate verb set for SVO slot extraction (kept deliberately coarse).
+_VERB_SET = {
+    "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "do", "does", "did", "will", "would", "can", "could", "shall", "should",
+    "may", "might", "must", "use", "uses", "using", "refer", "refers",
+    "mean", "means", "involve", "involves", "include", "includes",
+    "provide", "provides", "enable", "enables", "allow", "allows",
+    "help", "helps", "measure", "measures", "detect", "detects",
+    "capture", "captures", "record", "records", "observe", "observes",
+    "monitor", "monitors", "support", "supports", "contain", "contains",
+    "consist", "consists", "apply", "applies", "work", "works",
+    "operate", "operates", "give", "gives", "make", "makes", "take",
+    "takes", "need", "needs", "require", "requires", "cover", "covers",
+    "produce", "produces", "create", "creates", "build", "builds",
+    "develop", "develops", "design", "designs", "test", "tests",
+    "check", "checks", "compare", "compares", "analyze", "analyzes",
+    "evaluate", "evaluates", "assess", "assesses", "estimate",
+    "estimates", "calculate", "calculates", "compute", "computes",
+    "derive", "derives", "extract", "extracts", "process", "processes",
+    "transform", "transforms", "convert", "converts", "transmit",
+    "transmits", "receive", "receives", "send", "sends", "store",
+    "stores", "load", "loads", "save", "saves", "scan", "scans", "map",
+    "maps", "model", "models", "simulate", "simulates", "predict",
+    "predicts", "forecast", "forecasts", "classify", "classifies",
+    "cluster", "clusters", "segment", "segments", "recognize",
+    "recognizes", "identify", "identifies", "locate", "locates", "track",
+    "tracks", "quantify", "quantifies", "validate", "validates",
+    "verify", "verifies", "calibrate", "calibrates", "correct",
+    "corrects", "adjust", "adjusts", "optimize", "optimizes", "improve",
+    "improves", "enhance", "enhances", "reduce", "reduces", "increase",
+    "increases", "decrease", "decreases", "minimize", "minimizes",
+    "maximize", "maximizes", "balance", "balances", "control",
+    "controls", "manage", "manages", "handle", "handles", "deal",
+    "deals", "cope", "copes", "execute", "executes", "implement",
+    "implements", "utilize", "utilizes", "employ", "employs", "leverage",
+    "leverages", "adopt", "adopts", "adapt", "adapts",
+}
+
+_AUXILIARIES = {
+    "do", "does", "did", "is", "are", "was", "were", "be", "been",
+    "being", "has", "have", "had", "can", "could", "will", "would",
+    "shall", "should", "may", "might", "must",
+}
+
+_NEGATIONS = {
+    "not", "no", "never", "none", "nor", "neither", "without", "n't",
+    "hardly", "barely",
+}
+
+
+def _tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9°'’-]+", text.lower())
+
+
+def _subject_and_predicate(text: str) -> tuple[str, Optional[str]]:
+    """Rough SVO slot extraction: subject words before the head verb."""
+    words = re.findall(r"[A-Za-z0-9°.\u2019'-]+", text)
+    if not words:
+        return "", None
+    lowers = [w.lower() for w in words]
+    i = next((k for k, w in enumerate(lowers) if w in _VERB_SET), None)
+    if i is None:
+        return " ".join(words[:2]), None
+    subj = " ".join(words[:i]).strip() if i > 0 else " ".join(words[:2])
+    j = i
+    # walk past auxiliaries + negations to reach the head verb
+    while j + 1 < len(lowers) and (lowers[j] in _AUXILIARIES or lowers[j] in _NEGATIONS):
+        j += 1
+    head = lowers[j]
+    if head not in _VERB_SET:
+        head = lowers[i]  # no real head verb ahead: stay on the copula
+    elif head not in _AUXILIARIES and head.endswith("s"):
+        head = head.rstrip("s")  # crude lemma: "requires" -> "require"
+    return subj, head
+
+
+def _extract_subject(sentence: str) -> Optional[str]:
+    subj, _ = _subject_and_predicate(sentence)
+    return subj or None
+
+
+def _has_negation(text: str) -> bool:
+    return any(t in _NEGATIONS for t in _tokens(text))
+
+
+def _content_overlap(a: str, b: str) -> float:
+    """Shared content-token fraction over the shorter sentence."""
+    ta, tb = set(_tokens(a)), set(_tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / min(len(ta), len(tb))
+
+
+# "The <noun> of <subject> is <object>" -> functional predicate, one output per
+# input. Covers the spec's capital-of examples without a full NLP parse.
+_FUNC_PRED_RE = re.compile(
+    r"^\s*the\s+(\w+)\s+of\s+(.+?)\s+(?:is|are|was|were)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+_COPIULA = _AUXILIARIES
+
+
+def _svo_slots(text: str) -> tuple[str, Optional[str]]:
+    """(subject, functional predicate) for contradiction gating."""
+    m = _FUNC_PRED_RE.match(text)
+    if m:
+        return m.group(2).strip().lower(), m.group(1).lower() + " of"
+    subj, pred = _subject_and_predicate(text)
+    return subj.lower(), pred
+
+
+def _is_contradiction(new_text: str, old_text: str) -> bool:
+    """Deterministic tier-2 check: functional-predicate slot clash or
+    polarity inversion. Caller pre-gates on dense sim >= 0.65."""
+    s_new, p_new = _svo_slots(new_text)
+    s_old, p_old = _svo_slots(old_text)
+    if not p_new or not p_old:
+        # No functional predicate to compare: fall back to pure polarity
+        # inversion on overlapping content.
+        overlap = set(_tokens(new_text)) & set(_tokens(old_text))
+        shared = {t for t in overlap if t not in _NEGATIONS}
+        return _has_negation(new_text) != _has_negation(old_text) and len(shared) >= 3
+    if s_new != s_old or p_new != p_old:
+        return False
+    if p_new in _COPIULA:
+        # "X is A" vs "X is B" is not a contradiction (non-functional copula);
+        # only a negation flip on the *same statement* is.
+        return (
+            _has_negation(new_text) != _has_negation(old_text)
+            and _content_overlap(new_text, old_text) >= 0.5
+        )
+    obj_new = set(_tokens(new_text)) - set(_tokens(s_new)) - {p_new}
+    obj_old = set(_tokens(old_text)) - set(_tokens(s_old)) - {p_old}
+    slot_clash = bool(obj_new != obj_old and (obj_new | obj_old))
+    polarity = (
+        _has_negation(new_text) != _has_negation(old_text)
+        and _content_overlap(new_text, old_text) >= 0.5
+    )
+    return slot_clash or polarity
 
 class RTUMemoryBlock(nn.Module):
     """Plastic Recurrent Trace Unit for semantic sentence/chunk vectors."""
@@ -61,7 +208,8 @@ class DroidEngine(nn.Module):
     Sub-30MB Lifelong Learning Droid Engine.
     Combines frozen ONNX MiniLM semantic backbone with plastic RTU memory.
     """
-    def __init__(self, name: str = "droid-alpha", dim: int = 384):
+    def __init__(self, name: str = "droid-alpha", dim: int = 384,
+                 db_path: Optional[str] = None):
         super().__init__()
         self.name = name
         self.dim = dim
@@ -69,19 +217,34 @@ class DroidEngine(nn.Module):
 
         # 1. Semantic Anchor (quantized ONNX, 22MB)
         self.anchor = OnnxMiniLM()
-        
+
         # 2. Plastic RTU Memory
         self.memory = RTUMemoryBlock(dim=dim)
-        
-        # 3. Episodic Knowledge Bank (propositions, sources, embeddings)
-        self.knowledge_bank: List[Dict[str, Any]] = []
+
+        # 3. Episodic Knowledge Store (SQLite WAL + FTS5 + dense MVM + TMS)
+        self.knowledge = KnowledgeStore(db_path or ":memory:", dim=dim)
+        # ponytail: kept as inert attribute for app.py reset-button compat;
+        # vectors now live in the SQLite store.
         self.knowledge_vectors: Optional[torch.Tensor] = None
+
+        # Discourse state for rolling anaphora resolution (design Decision 4)
+        self._discourse_subject: Optional[str] = None
 
         # 4. Learning counters & Audit logs
         self.step_count = 0
         self.logs: List[Dict[str, Any]] = []
         self.base_lr = 0.05
         self.last_query: Optional[str] = None
+
+    @property
+    def knowledge_bank(self) -> List[Dict[str, Any]]:
+        """Back-compat view: active facts as plain dict list."""
+        return self.knowledge.get_active_facts()
+
+    def clear_knowledge(self):
+        """Wipe episodic knowledge (RTU memory stays)."""
+        self.knowledge.clear_all()
+        self._discourse_subject = None
 
     def log(self, message: str, level: str = "INFO", details: Optional[Dict[str, Any]] = None):
         entry = {
@@ -138,19 +301,43 @@ class DroidEngine(nn.Module):
 
         return merged if merged else [text.strip()]
 
+    def _resolve_anaphora(self, propositions: List[str]) -> List[str]:
+        """Rolling discourse anaphora resolution (design Decision 4).
+
+        Third-person pronouns at a proposition's start are anchored to the
+        last active subject, carried across paragraph/teach() boundaries.
+        Only replaced when a single clear subject exists; otherwise untouched.
+        """
+        resolved: List[str] = []
+        last_subject = self._discourse_subject
+        for p in propositions:
+            s = p.strip()
+            m = _ANAPHORA_RE.match(s)
+            if m and last_subject:
+                s = _ANAPHORA_RE.sub(last_subject, s, count=1)
+            resolved.append(s)
+            subj = _extract_subject(s)
+            if subj:
+                last_subject = subj
+        self._discourse_subject = last_subject
+        return resolved
+
     def teach(self, text: str, source: str = "chat", auto_tune: bool = True) -> Dict[str, Any]:
         """
         In-chat conversational knowledge absorption.
         Updates plastic RTU memory weights without destroying base stability.
+        Propositions go through rolling anaphora resolution and two-tier
+        contradiction gating before insertion into the KnowledgeStore.
         """
         if not text or len(text.strip()) == 0:
             return {"status": "empty", "chunks": 0}
 
         t0 = time.perf_counter()
         propositions = self._split_into_propositions(text)
+        propositions = self._resolve_anaphora(propositions)
 
-        # Deduplicate against already-stored knowledge to prevent repeated facts
-        existing_facts = {f["text"].lower().strip() for f in self.knowledge_bank}
+        # Deduplicate against active stored knowledge to prevent repeated facts
+        existing_facts = self.knowledge.get_active_texts()
         unique_propositions = []
         for p in propositions:
             clean_p = p.lower().strip()
@@ -167,16 +354,17 @@ class DroidEngine(nn.Module):
                 "avg_novelty": 0.0,
                 "memory_norm": float(torch.norm(self.memory.states).item()),
                 "effective_lr": self.base_lr,
-                "total_knowledge": len(self.knowledge_bank)
+                "total_knowledge": self.knowledge.active_count()
             }
 
         propositions = unique_propositions
         self.log(f"Teaching {len(propositions)} new propositions from '{source}'...", details={"source": source})
 
-        # 1. Semantic Embeddings via ONNX Anchor
+        # 1. Semantic Embeddings via ONNX Anchor, pre-normalized on insert
         embs = self.anchor.embed(propositions)  # (N, 384)
         if embs.dim() == 1:
             embs = embs.unsqueeze(0)
+        embs = torch.nn.functional.normalize(embs, p=2, dim=-1)
 
         # 2. Auto-tuned dynamic learning rate based on experience count
         if auto_tune:
@@ -184,15 +372,16 @@ class DroidEngine(nn.Module):
         else:
             effective_lr = self.base_lr
 
-        # 3. Plastic RTU memory update
+        # 3. Plastic RTU memory update + episodic registration with TMS
         decay = torch.sigmoid(self.memory.decay)
         with torch.no_grad():
             curr_state = self.memory.states.clone()
             novelty_losses = []
-            
+            superseded_total = 0
+
             for i in range(embs.shape[0]):
                 e_i = embs[i]
-                
+
                 # Novelty measure: cosine difference with current state
                 state_norm = torch.norm(curr_state, p=2)
                 if state_norm > 1e-6:
@@ -205,25 +394,23 @@ class DroidEngine(nn.Module):
 
                 # Plastic state accumulation: h_t = decay * h_{t-1} + e_t
                 curr_state = (decay * curr_state) + (e_i * (1.0 + 0.5 * novelty))
-                
-                # Episodic knowledge registration
-                fact_entry = {
-                    "text": propositions[i],
-                    "source": source,
-                    "timestamp": time.time(),
-                    "step": self.step_count + i,
-                    "novelty": float(novelty)
-                }
-                self.knowledge_bank.append(fact_entry)
+
+                # Two-tier contradiction gating (design Decision 3):
+                # tier-1 dense sim >= 0.65, tier-2 deterministic SVO clash.
+                conflicts = [
+                    c["id"] for c in self.knowledge.find_similar(e_i, 0.65)
+                    if _is_contradiction(propositions[i], c["text"])
+                ]
+                new_id = self.knowledge.insert_fact(
+                    propositions[i], source, time.time(),
+                    self.step_count + i, float(novelty), e_i,
+                )
+                for old_id in conflicts:
+                    self.knowledge.supersede(old_id, new_id)
+                superseded_total += len(conflicts)
 
             # Bound memory state norm with LayerNorm scaling
             self.memory.states.copy_(curr_state)
-            
-            # Update knowledge vector matrix
-            if self.knowledge_vectors is None:
-                self.knowledge_vectors = embs.clone()
-            else:
-                self.knowledge_vectors = torch.cat([self.knowledge_vectors, embs], dim=0)
 
             # Plastic decay adjustment (slow adaptation)
             self.memory.decay.data.add_(-effective_lr * 0.01 * (decay - 0.9))
@@ -240,7 +427,8 @@ class DroidEngine(nn.Module):
             "avg_novelty": avg_novelty,
             "memory_norm": mem_norm,
             "effective_lr": effective_lr,
-            "total_knowledge": len(self.knowledge_bank)
+            "total_knowledge": self.knowledge.active_count(),
+            "superseded": superseded_total
         }
         self.log(
             f"Successfully learned {len(propositions)} facts in {elapsed*1000:.1f}ms. State norm: {mem_norm:.2f}.",
@@ -249,31 +437,27 @@ class DroidEngine(nn.Module):
         return result
 
     def recall(self, query: str, top_k: int = 3, threshold: float = 0.50) -> List[Dict[str, Any]]:
-        """Retrieve most relevant learned facts using pure semantic matching."""
-        if not self.knowledge_bank or self.knowledge_vectors is None:
+        """Retrieve most relevant active facts via hybrid lexical+dense RRF.
+
+        Superseded (contradicted) facts are excluded; `similarity` reports
+        the dense cosine component of the fused result.
+        """
+        if self.knowledge.total_count() == 0:
             return []
 
         q_emb = self.anchor.embed(query)  # (384,)
         if q_emb.dim() > 1:
             q_emb = q_emb.squeeze(0)
-        q_emb = q_emb / torch.norm(q_emb).clamp(min=1e-6)
-        
-        with torch.no_grad():
-            # Match directly against normalized knowledge vectors
-            kv_norms = torch.norm(self.knowledge_vectors, p=2, dim=1, keepdim=True).clamp(min=1e-6)
-            normed_kv = self.knowledge_vectors / kv_norms
-            sims = torch.mv(normed_kv, q_emb)
-            
-            top_vals, top_indices = torch.topk(sims, k=min(top_k, len(self.knowledge_bank)))
-            
-            matches = []
-            for val, idx in zip(top_vals, top_indices):
-                score = float(val.item())
-                if score >= threshold:
-                    entry = dict(self.knowledge_bank[idx.item()])
-                    entry["similarity"] = score
-                    matches.append(entry)
-            return matches
+        q_emb = q_emb / torch.linalg.vector_norm(q_emb).clamp(min=1e-6)
+
+        matches = self.knowledge.recall(q_emb, top_k=top_k, query_text=query)
+        hits: List[Dict[str, Any]] = []
+        for m in matches:
+            sim = m.get("dense_similarity") or 0.0
+            m["similarity"] = sim
+            if sim >= threshold:
+                hits.append(m)
+        return hits
 
     def _is_duplicate_or_subsumed(self, s1: str, s2: str) -> bool:
         """Check if two sentences are near-duplicates or one is subsumed by the other."""
@@ -339,7 +523,7 @@ class DroidEngine(nn.Module):
             return "I am your Droid assistant with plastic RTU memory. I have not learned any domain knowledge yet. Send me a paragraph or explanation, and I will absorb it instantly."
 
     def save_profile(self, target_dir: str):
-        """Save Droid weights, configuration, knowledge bank, and logs."""
+        """Save Droid weights, configuration, knowledge store DB, and logs."""
         p = Path(target_dir)
         p.mkdir(parents=True, exist_ok=True)
 
@@ -349,7 +533,7 @@ class DroidEngine(nn.Module):
             "dim": self.dim,
             "step_count": self.step_count,
             "base_lr": self.base_lr,
-            "total_facts": len(self.knowledge_bank),
+            "total_facts": self.knowledge.active_count(),
             "updated_at": time.time()
         }
         with open(p / "config.json", "w") as f:
@@ -361,13 +545,11 @@ class DroidEngine(nn.Module):
             "decay": self.memory.decay.detach().cpu().contiguous(),
             "proj_weight": self.memory.proj.weight.detach().cpu().contiguous(),
         }
-        if self.knowledge_vectors is not None:
-            weights["knowledge_vectors"] = self.knowledge_vectors.detach().cpu().contiguous()
         save_file(weights, str(p / "memory.safetensors"))
 
-        # 3. Knowledge bank
-        with open(p / "knowledge.json", "w") as f:
-            json.dump(self.knowledge_bank, f, indent=2)
+        # 3. Knowledge store: checkpoint WAL, then export a consistent DB
+        self.knowledge.checkpoint()
+        self.knowledge.export_to(str(p / "knowledge.db"))
 
         # 4. Logs
         with open(p / "train_log.json", "w") as f:
@@ -376,11 +558,13 @@ class DroidEngine(nn.Module):
         self.log(f"Profile saved to {target_dir}")
 
     def load_profile(self, target_dir: str) -> bool:
-        """Load Droid weights, config, knowledge bank, and logs from directory."""
+        """Load Droid weights, config, knowledge store DB, and logs from dir.
+
+        Migrate legacy profiles that still store knowledge in knowledge.json.
+        """
         p = Path(target_dir)
         config_file = p / "config.json"
         mem_file = p / "memory.safetensors"
-        know_file = p / "knowledge.json"
 
         if not config_file.exists() or not mem_file.exists():
             return False
@@ -390,7 +574,7 @@ class DroidEngine(nn.Module):
 
         self.name = config.get("name", self.name)
         self.step_count = config.get("step_count", 0)
-        self.base_lr = config.get("base_lr", 0.05)
+        self.base_lr = config.get("base_lr", self.base_lr)
 
         # Load weights
         weights = load_file(str(mem_file))
@@ -401,13 +585,39 @@ class DroidEngine(nn.Module):
                 self.memory.decay.copy_(weights["decay"])
             if "proj_weight" in weights:
                 self.memory.proj.weight.copy_(weights["proj_weight"])
-            if "knowledge_vectors" in weights:
-                self.knowledge_vectors = weights["knowledge_vectors"].clone()
 
-        # Load knowledge bank
-        if know_file.exists():
-            with open(know_file, "r") as f:
-                self.knowledge_bank = json.load(f)
+        # Load knowledge store (SQLite DB, or legacy knowledge.json migration)
+        db_file = p / "knowledge.db"
+        know_file = p / "knowledge.json"
+        self.knowledge.close()
+        if db_file.exists():
+            self.knowledge = KnowledgeStore(str(db_file), dim=self.dim)
+        else:
+            self.knowledge = KnowledgeStore(":memory:", dim=self.dim)
+            if know_file.exists():
+                with open(know_file, "r") as f:
+                    legacy_facts = json.load(f)
+                # Legacy profiles stored raw vectors in memory.safetensors when
+                # available; re-embed only what is missing.
+                legacy_vecs = weights.get("knowledge_vectors")
+                for i, fact in enumerate(legacy_facts):
+                    vec = None
+                    if legacy_vecs is not None and i < len(legacy_vecs):
+                        vec = legacy_vecs[i].float()
+                    if vec is None:
+                        vec = self.anchor.embed(fact["text"])
+                        if vec.dim() == 1:
+                            vec = vec
+                        else:
+                            vec = vec.squeeze(0)
+                    self.knowledge.insert_fact(
+                        fact["text"],
+                        fact.get("source", "legacy"),
+                        fact.get("timestamp", time.time()),
+                        fact.get("step", i),
+                        fact.get("novelty", 0.0),
+                        vec,
+                    )
 
         # Load logs
         log_file = p / "train_log.json"
