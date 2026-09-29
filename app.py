@@ -429,7 +429,7 @@ with tab_teach:
                 else:
                     text_to_teach = teach_text
 
-                result = active_droid.teach(text_to_teach, source="webui_ingest", auto_tune=True)
+                result = active_droid.teach(text_to_teach, source="webui_ingest")
                 droid_mgr.save_droid(st.session_state.selected_droid_name)
 
             st.success(
@@ -492,7 +492,13 @@ with tab_memory:
                         })
                     
                     df = pd.DataFrame(display_data)
-                    st.dataframe(df, use_container_width=True, height=300)
+                    df["ID"] = df["ID"].astype(int)
+                    df["Text"] = df["Text"].astype(str)
+                    df["Source"] = df["Source"].astype(str)
+                    df["Timestamp"] = df["Timestamp"].astype(str)
+                    df["Novelty"] = df["Novelty"].astype(str)
+                    df["Access"] = df["Access"].astype(int)
+                    st.dataframe(df, width='stretch', height=300)
                     
                     # Detailed fact management
                     st.markdown("#### Manage Individual Fact")
@@ -689,8 +695,31 @@ with tab_logs:
     if engine_mode.startswith("Droid"):
         logs = active_droid.logs
         if logs:
-            df_logs = pd.DataFrame(logs)
-            st.dataframe(df_logs)
+            import json as _json
+
+            safe_rows = []
+            for entry in logs[-200:]:
+                ts = entry.get("timestamp", 0)
+                if isinstance(ts, (int, float)):
+                    ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(ts)))
+                else:
+                    ts_str = str(ts)
+                details = entry.get("details", "")
+                if isinstance(details, dict):
+                    try:
+                        details_str = _json.dumps(details, default=str)[:800]
+                    except Exception:
+                        details_str = str(details)[:800]
+                else:
+                    details_str = str(details)[:800] if details else ""
+                safe_rows.append({
+                    "timestamp": ts_str,
+                    "message": str(entry.get("message", "")),
+                    "details": details_str,
+                })
+
+            df_logs = pd.DataFrame(safe_rows).astype(str)
+            st.dataframe(df_logs, width='stretch')
             if st.button("Clear Logs"):
                 active_droid.logs.clear()
                 st.rerun()
