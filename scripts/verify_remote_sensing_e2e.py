@@ -29,7 +29,7 @@ def run_verification():
     )
     
     print(f"\n[1] Teaching '{droid_name}' the Remote Sensing paragraph...")
-    res = droid.teach(user_paragraph, source="conversational_chat", auto_tune=True)
+    res = droid.teach(user_paragraph, source="conversational_chat")
     print(f"  -> Result: {res['status']}")
     print(f"  -> Propositions learned: {res['propositions']}")
     print(f"  -> Elapsed: {res['elapsed_ms']:.2f} ms")
