@@ -16,6 +16,13 @@ The system SHALL accept unstructured domain text directly in the chat stream and
 - **WHEN** conversational teaching is repeated over 5 or more successive turns
 - **THEN** output logits and stop probabilities SHALL remain bounded and English syntax stability SHALL not degrade to empty or repeated characters
 
+#### Scenario: Human verifies LLM-synthesized response before absorption
+- **WHEN** the assistant generates an LLM-synthesized response (source: llm_grounded_memory or llm_general_knowledge)
+- **WHEN** user expands the inline Memory Console feedback section
+- **WHEN** user selects one or more extracted propositions and clicks "Accept Selected"
+- **THEN** the system SHALL teach ONLY the selected propositions to the Droid via `droid.teach()`
+- **THEN** the system SHALL display absorption confirmation (fact count, memory norm)
+
 ### Requirement: Automatic Hyperparameter Selection
 The system SHALL automatically determine the learning rate, decay half-life, and consolidation iterations based on the ingested text length without user prompt.
 

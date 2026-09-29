@@ -623,6 +623,96 @@ class KnowledgeStore:
         ).fetchall()
         return [self._to_dict(r) for r in rows]
 
+    def get_fact(self, fact_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve single fact by ID with all metadata."""
+        row = self.conn.execute(
+            "SELECT id, text, source, timestamp, step, novelty, superseded, valid_until, superseded_by, access_count, last_retrieved, version_id, feedback, needs_review FROM facts WHERE id = ?",
+            (int(fact_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._to_dict(row)
+
+    def update_fact(self, fact_id: int, new_text: str, new_vec: Optional[torch.Tensor] = None) -> int:
+        """Update fact text and re-embed vector. Invalidates caches."""
+        fact_id = int(fact_id)
+        # Check exists
+        existing = self.conn.execute("SELECT id FROM facts WHERE id = ?", (fact_id,)).fetchone()
+        if existing is None:
+            return 0
+        
+        # Embed if vec not provided
+        if new_vec is None:
+            try:
+                # Try to import anchor and embed
+                from src.model.onnx_anchor import OnnxMiniLM
+                anchor = OnnxMiniLM()
+                new_vec = anchor.embed(new_text, to_torch=True)
+            except Exception:
+                try:
+                    from .onnx_anchor import OnnxMiniLM
+                    anchor = OnnxMiniLM()
+                    new_vec = anchor.embed(new_text, to_torch=True)
+                except Exception as e:
+                    # Fallback: keep old vector if embedding fails
+                    row = self.conn.execute("SELECT vec FROM facts_vecs WHERE id = ?", (fact_id,)).fetchone()
+                    if row:
+                        import numpy as np
+                        vec_np = np.frombuffer(row[0], dtype=np.float32)
+                        new_vec = torch.from_numpy(vec_np)
+                    else:
+                        new_vec = torch.randn(self.dim)
+
+        v = new_vec.detach().float().reshape(-1)
+        norm = torch.linalg.vector_norm(v).clamp(min=1e-8)
+        v = v / norm
+
+        self.conn.execute("BEGIN")
+        try:
+            # Update facts table
+            self.conn.execute(
+                "UPDATE facts SET text = ?, timestamp = ? WHERE id = ?",
+                (new_text, time.time(), fact_id),
+            )
+            # Update vec
+            self.conn.execute(
+                "UPDATE facts_vecs SET vec = ? WHERE id = ?",
+                (v.cpu().contiguous().numpy().tobytes(), fact_id),
+            )
+            # Rebuild FTS - simplest: delete and insert
+            self.conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (fact_id,))
+            self.conn.execute(
+                "INSERT INTO facts_fts(rowid, text) VALUES (?,?)", (fact_id, new_text)
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        
+        self._vec_cache = None
+        self._id_cache = None
+        return 1
+
+    def delete_fact(self, fact_id: int) -> int:
+        """Delete fact entirely from all tables. Invalidates caches."""
+        fact_id = int(fact_id)
+        self.conn.execute("BEGIN")
+        try:
+            cur = self.conn.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+            deleted = cur.rowcount
+            self.conn.execute("DELETE FROM facts_vecs WHERE id = ?", (fact_id,))
+            self.conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (fact_id,))
+            # Also clean feedback log? Keep for audit, but optional
+            # self.conn.execute("DELETE FROM feedback_log WHERE fact_id = ?", (fact_id,))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        
+        self._vec_cache = None
+        self._id_cache = None
+        return deleted
+
     def total_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) FROM facts").fetchone()
         return row[0] if row else 0

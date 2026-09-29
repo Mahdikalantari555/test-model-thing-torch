@@ -121,6 +121,16 @@ except:
         confidence_tier = None
         estimate_confidence = None
 
+
+try:
+    from src.model.propositions import extract_propositions, extract_propositions_with_fallback
+except:
+    try:
+        from .propositions import extract_propositions, extract_propositions_with_fallback
+    except:
+        extract_propositions = None
+        extract_propositions_with_fallback = None
+
 __all__ = [
     "Model",
     "Layer",
@@ -147,4 +157,6 @@ __all__ = [
     "ContradictionResolver",
     "RetrievalPolicy",
     "ContinuousStream",
+    "extract_propositions",
+    "extract_propositions_with_fallback",
 ]
