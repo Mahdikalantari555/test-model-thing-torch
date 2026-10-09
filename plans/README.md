@@ -14,11 +14,17 @@ Guiding decisions, fixed up front:
    excuse to start experimenting before reproduction lands.
 
 3. **Remote-sensing "plastic model" is a separate track.** See
-   `09_remote_sensing_plastic_model.md`. It defines interface
+   `06_remote_sensing_plastic_model.md`. It defines interface
    requirements that the text-path implementation must satisfy *without*
    adding architectural complexity to the reproduction itself.
 
 Read order: `01_source_analysis.md` → the contracts → verification.
+
+Post-reproduction tracks (not part of the port):
+
+- `09_recamem_plan.md` — rebrand + two-tier plasticity umbrella plan.
+- `10_droid_rtu_fusion.md` — focused slice of 09: fuse the raw byte RTU with the
+  droid memory engine (`ByteRtuBackend`, frozen at inference).
 
 Every spec used to mark items that must be confirmed against the MLX runtime
 as `[VERIFY]`. **All seven are now RESOLVED** — MLX cannot execute in this
