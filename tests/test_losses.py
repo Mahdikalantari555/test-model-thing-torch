@@ -55,3 +55,46 @@ def test_total_loss_composition():
     assert 'pred' in losses
     assert 'ce' in losses
     assert 'stop' in losses
+
+def test_ce_only_loss_skips_variance_pred_and_stop():
+    """ce_only keeps only the crossentropy term (upstream jrz97619761/test-model-thing --ce-only)."""
+    dim = 32
+    x = torch.randn(dim)
+    output = torch.randn(256)
+    stop = torch.tensor([0.1])
+    tgt = torch.randn(dim)
+    nextb = 10
+
+    total, losses = compute_losses(x, output, stop, tgt=tgt, nextb=nextb, end=True, ce_only=True)
+
+    assert torch.allclose(total, loss_crossentropy(output, nextb))
+    assert set(losses) == {'ce', 'total'}
+
+def test_ce_only_loss_without_nextb_is_zero():
+    """With no nextb the ce_only loss is a scalar 0 (matches the MLX reference)."""
+    dim = 32
+    x = torch.randn(dim)
+    output = torch.randn(256)
+    stop = torch.tensor([0.1])
+
+    total, losses = compute_losses(x, output, stop, tgt=None, nextb=None, end=False, ce_only=True)
+
+    assert float(total) == 0.0
+    assert losses == {'total': total}
+
+def test_default_mode_is_unchanged():
+    """The ce_only flag must default off so existing callers keep the old loss composition."""
+    dim = 32
+    x = torch.randn(dim)
+    output = torch.randn(256)
+    stop = torch.tensor([0.1])
+    tgt = torch.randn(dim)
+    nextb = 10
+
+    total_default, losses_default = compute_losses(x, output, stop, tgt=tgt, nextb=nextb, end=True)
+    total_explicit, losses_explicit = compute_losses(
+        x, output, stop, tgt=tgt, nextb=nextb, end=True, ce_only=False
+    )
+
+    assert torch.allclose(total_default, total_explicit)
+    assert losses_default.keys() == losses_explicit.keys()

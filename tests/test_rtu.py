@@ -102,3 +102,45 @@ def test_rtu_stop_gradient_detached():
     # Detaching persistent buffer assignment
     layer.states.copy_(state.detach())
     assert not layer.states.requires_grad
+
+def test_model_forward_accepts_ce_only():
+    """Model.forward takes the ce_only flag and still commits trace buffers (upstream --ce-only port)."""
+    from src.model.rtu import Model
+
+    torch.manual_seed(0)
+    model = Model(dim=32, layers=2, spread=16)
+
+    before_states = model.blocks[0].states.detach().clone()
+    _, loss = model(10, nextb=11, end=False, frozen=False, ce_only=True)
+
+    assert loss >= 0.0
+    assert model.step_count == 1
+    assert model.last_loss == loss
+    # Trace buffers must still advance under ce_only.
+    assert not torch.allclose(model.blocks[0].states, before_states)
+
+def test_model_save_preserves_trace_buffers():
+    """Regression guard: trace buffers stay in checkpoints (upstream removed them, we must not)."""
+    import os
+    import tempfile
+    from src.model.rtu import Model
+
+    torch.manual_seed(0)
+    model = Model(dim=32, layers=2, spread=16)
+    model(10, nextb=11, end=False, frozen=False)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'model.safetensors')
+        model.save(path)
+
+        from safetensors.torch import load_file
+        data = load_file(path)
+        for i in range(model.layers):
+            assert f'state.{i}' in data
+            assert f'decaytrace.{i}' in data
+            assert f'embedtrace.{i}' in data
+
+        model2 = Model(dim=32, layers=2, spread=16)
+        model2.load(path)
+        assert torch.allclose(model2.blocks[0].decaytrace, model.blocks[0].decaytrace)
+        assert torch.allclose(model2.blocks[0].embedtrace, model.blocks[0].embedtrace)

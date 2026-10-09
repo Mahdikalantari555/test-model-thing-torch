@@ -168,7 +168,19 @@ def loss_stop_mse(stop: torch.Tensor, end: bool) -> torch.Tensor:
 def compute_losses(x: torch.Tensor, output: torch.Tensor, stop: torch.Tensor,
                    tgt: torch.Tensor | None = None,
                    nextb: int | torch.Tensor | None = None,
-                   end: bool = False) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                   end: bool = False,
+                   ce_only: bool = False) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    if ce_only:
+        # Crossentropy-only training mode: variance / prediction / stop losses are skipped.
+        if nextb is not None:
+            total = loss_crossentropy(output, nextb)
+            losses: Dict[str, torch.Tensor] = {'ce': total}
+        else:
+            total = torch.zeros((), dtype=output.dtype, device=output.device)
+            losses = {}
+        losses['total'] = total
+        return total, losses
+
     l_var = loss_variance(x)
     losses = {'var': l_var}
     total = l_var
@@ -244,7 +256,8 @@ class Model(nn.Module):
         return self.rate * (1.0 - 0.9 * progress)
 
     def forward(self, currb: int | torch.Tensor, nextb: int | torch.Tensor | None = None,
-                end: bool = False, frozen: bool = False) -> Tuple[int, float]:
+                end: bool = False, frozen: bool = False,
+                ce_only: bool = False) -> Tuple[int, float]:
         if frozen:
             with torch.no_grad():
                 c = torch.tensor(currb, dtype=torch.long, device=self.device) if not isinstance(currb, torch.Tensor) else currb
@@ -263,9 +276,10 @@ class Model(nn.Module):
                 tgt = self.encoder(n).detach()
 
         (x, states, decays), (output, stop) = self.step(c, dummies=dummies, frozen=False)
-        total_loss, _ = compute_losses(x, output, stop, tgt=tgt, nextb=nextb, end=end)
+        total_loss, _ = compute_losses(x, output, stop, tgt=tgt, nextb=nextb, end=end, ce_only=ce_only)
         self.last_loss = float(total_loss.item())
-        total_loss.backward()
+        if total_loss.requires_grad:
+            total_loss.backward()
 
         c_val = int(currb) if not isinstance(currb, torch.Tensor) else int(currb.item())
         c_range = (torch.arange(self.vocab_size, device=self.device) == c_val).float().unsqueeze(1)
@@ -298,8 +312,9 @@ class Model(nn.Module):
         return self.sample(output.detach()), float(stop.detach().item())
 
     def __call__(self, currb: int | torch.Tensor, nextb: int | torch.Tensor | None = None,
-                 end: bool = False, frozen: bool = False) -> Tuple[int, float]:
-        return self.forward(currb, nextb=nextb, end=end, frozen=frozen)
+                 end: bool = False, frozen: bool = False,
+                 ce_only: bool = False) -> Tuple[int, float]:
+        return self.forward(currb, nextb=nextb, end=end, frozen=frozen, ce_only=ce_only)
 
     def reset(self):
         for layer in self.blocks:

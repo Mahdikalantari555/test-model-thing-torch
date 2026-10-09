@@ -24,8 +24,8 @@ class Runtime:
         if self.step % 500 == 0:
             self.model.save(self.path)
 
-    def call(self, c: int, n: int | None, end: bool, save: bool, frozen: bool):
-        outputs = self.model(c, n, end, frozen)
+    def call(self, c: int, n: int | None, end: bool, save: bool, frozen: bool, ce_only: bool):
+        outputs = self.model(c, n, end, frozen, ce_only)
         if save:
             self.save()
         return outputs
@@ -34,7 +34,7 @@ class Runtime:
         sys.stdout.buffer.write(bytes([b]))
         sys.stdout.flush()
 
-    def chat(self, save: bool, frozen: bool):
+    def chat(self, save: bool, frozen: bool, ce_only: bool):
         timestamp = None
 
         while True:
@@ -44,20 +44,20 @@ class Runtime:
             data = (text + '\n').encode('utf-8')
 
             for i, (c, n) in enumerate(itertools.pairwise(data)):
-                b, _ = self.call(c, n, i == len(data) - 2, save, frozen)
+                b, _ = self.call(c, n, i == len(data) - 2, save, frozen, ce_only)
 
             print(f'\n[{self.now()}]\nModel >> ', end='', flush=True)
 
             b = data[-1]
             while True:
-                b, stop = self.call(b, None, False, save, frozen)
+                b, stop = self.call(b, None, False, save, frozen, ce_only)
                 self.write(b)
 
                 if stop > self.threshold:
                     print()
                     break
 
-    def train(self, save: bool, frozen: bool, dataset: str):
+    def train(self, save: bool, frozen: bool, dataset: str, ce_only: bool):
         files = glob.glob(dataset, recursive=True)
 
         if not files:
@@ -76,20 +76,20 @@ class Runtime:
                             continue
 
                         for i, (c, n) in enumerate(itertools.pairwise(data)):
-                            b, _ = self.call(c, n, i == len(data) - 2, save, frozen)
+                            b, _ = self.call(c, n, i == len(data) - 2, save, frozen, ce_only)
                             self.write(b)
 
     def now(self):
         return datetime.now().strftime('%d/%m/%Y, %H:%M:%S')
 
-    def __call__(self, mode: str, dataset: str, save: bool, frozen: bool):
+    def __call__(self, mode: str, dataset: str, save: bool, frozen: bool, ce_only: bool):
         self.model.load(self.path)
         print(f'parameters: {self.model.count():,}\n')
 
         try:
             match mode:
-                case 'train': self.train(save, frozen, dataset)
-                case 'chat': self.chat(save, frozen)
+                case 'train': self.train(save, frozen, dataset, ce_only)
+                case 'chat': self.chat(save, frozen, ce_only)
 
         finally:
             if save:
@@ -102,6 +102,7 @@ if __name__ == '__main__':
     parser.add_argument('mode', choices=['train', 'chat'])
 
     parser.add_argument('--frozen', action='store_true')
+    parser.add_argument('--ce-only', action='store_true')
     parser.add_argument('--no-save', action='store_false')
     parser.add_argument('--dataset', default='wikipedia_clean/**/wiki_*')
 
@@ -111,4 +112,4 @@ if __name__ == '__main__':
         path=args.path, threshold=0.35,
         dim=512, layers=16, spread=32, temp=0.75,
         rate=5e-4, bound=(40000, 120000)
-    )(args.mode, args.dataset, args.no_save, args.frozen)
+    )(args.mode, args.dataset, args.no_save, args.frozen, args.ce_only)

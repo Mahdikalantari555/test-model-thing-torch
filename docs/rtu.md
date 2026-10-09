@@ -57,3 +57,38 @@ $$
 ## Detach & Persistence Semantics
 
 In PyTorch, `states`, `decaytrace`, and `embedtrace` are registered buffers detached from the computational graph (`requires_grad=False`). They are updated in-place via `.copy_()` using detached values, preventing the optimizer from erroneously treating them as trainable weights while allowing weights and traces to round-trip through checkpoints.
+
+## Training Loss Modes
+
+The total loss spans four terms:
+
+$$
+\mathcal{L} = \underbrace{\text{var}}_{\text{anti-collapse}} + \underbrace{\text{pred mse}}_{\text{latent prediction}} + \underbrace{\text{ce}}_{\text{next-byte}} + \underbrace{\text{stop mse}}_{\text{stop token}}
+$$
+
+**Default mode** uses all four terms.
+
+**Crossentropy-only mode** (`ce_only=True`, CLI flag `--ce-only`) reduces this to the single
+crossentropy term:
+
+$$
+\mathcal{L}_{ce} = -\text{output}[n] + \log\sum\text{output}
+$$
+
+Ports from upstream `jrz97619761/test-model-thing`. The variance term is the anti-collapse
+regularizer that keeps state scale near unit variance, so dropping it trades stability for a pure
+language-modelling objective — do not combine `--ce-only` with aggressive learning rates.
+
+When `nextb` is `None` in `ce_only` mode the loss is a constant `0`; `Model.forward` therefore only
+calls `backward()` when the loss `requires_grad`, which keeps that path from raising.
+
+## Divergence From Upstream
+
+Upstream also stopped persisting the trace buffers (`state.i`, `decaytrace.i`, `embedtrace.i`) in
+the same commit that added `--ce-only`. This fork **keeps** that persistence, because:
+
+- `tests/test_checkpoint.py` asserts `decaytrace`/`embedtrace` round-trip through checkpoints.
+- The spec above documents the round-trip as intended behaviour.
+
+Consequently `main_mlx.py` is not byte-identical to upstream `main.py` — it is intentionally upstream
+plus trace-buffer persistence.
