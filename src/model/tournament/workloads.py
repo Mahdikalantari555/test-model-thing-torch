@@ -19,6 +19,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from src.model.benchmarks import find_contamination
 from src.model.cores.calibration import assert_disjoint_splits
+from src.model.tournament.large_workloads import (
+    build_large_blimp_probes,
+    build_large_continual_suite,
+    build_large_decision_suite,
+    build_large_routing_suite,
+    compute_corpus_unigram_bpb,
+    ensure_tinystories_real_data_dir,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FIXTURE_DIR = REPO_ROOT / "evals" / "tournament_fixtures"
@@ -46,6 +54,8 @@ class WorkloadBundle:
     status: str  # "ready" | "blocked"
     dataset_source: str  # "real" | "fixture" | "missing_real"
     reason: Optional[str] = None
+    corpus_metadata: Dict[str, Any] = field(default_factory=dict)
+    item_counts: Dict[str, Any] = field(default_factory=dict)
     lm_train: Dict[str, str] = field(default_factory=dict)
     lm_val_cal: Dict[str, str] = field(default_factory=dict)
     lm_test_eval: Dict[str, str] = field(default_factory=dict)
@@ -620,12 +630,14 @@ def load_tournament_workloads(
     fixture_dir: Path = DEFAULT_FIXTURE_DIR,
     real_data_dir: Optional[Path] = None,
     require_real_data: bool = False,
+    scale: str = "fixture",
     mqar_pairs: Sequence[int] = (4, 16, 32, 64),
     mqar_train_per_setting: int = 96,
     mqar_eval_per_setting: int = 32,
     seed: int = 1337,
 ) -> WorkloadBundle:
     """Load real datasets if provided/available, else deterministic offline fixtures."""
+    corpus_metadata: Dict[str, Any] = {}
     if real_data_dir is not None:
         rdir = Path(real_data_dir)
         req_files = [rdir / "train.jsonl", rdir / "val_cal.jsonl", rdir / "test_eval.jsonl"]
@@ -637,6 +649,9 @@ def load_tournament_workloads(
             lm_train = {r["id"]: r["text"] for r in train_rows}
             lm_val = {r["id"]: r["text"] for r in val_rows}
             lm_test = {r["id"]: r["text"] for r in test_rows}
+            prov_file = rdir / "provenance.json"
+            if prov_file.is_file():
+                corpus_metadata.update(json.loads(prov_file.read_text(encoding="utf-8")))
         elif require_real_data:
             return WorkloadBundle(
                 status="blocked",
@@ -674,6 +689,10 @@ def load_tournament_workloads(
     if offenders:
         raise ValueError(f"Contamination detected between lm_train and lm_test: {offenders}")
 
+    unigram_stats = compute_corpus_unigram_bpb(lm_train, lm_test)
+    corpus_metadata.update(unigram_stats)
+    corpus_metadata.setdefault("corpus_name", "Real Corpus" if dataset_source == "real" else "Offline Synthetic Fixture")
+
     # Extrapolation documents at target byte/token lengths {512, 1024, 2048, 4096}
     base_test_concat = " ".join(lm_test.values())
     extrapolation_docs: Dict[int, List[str]] = {}
@@ -682,50 +701,92 @@ def load_tournament_workloads(
         long_text = (base_test_concat + " ") * repeats
         extrapolation_docs[target_len] = [long_text[: target_len * 4]]
 
-    # Grammar probes: repo `evals/grammar_probes.jsonl` + bundled BLiMP minimal pairs
+    is_large = scale.strip().lower() == "large"
+
+    # Grammar probes: repo `evals/grammar_probes.jsonl` + bundled/large BLiMP minimal pairs
     grammar: List[Dict[str, Any]] = []
     if GRAMMAR_PROBES_PATH.is_file():
         grammar.extend(_read_jsonl(GRAMMAR_PROBES_PATH))
-    grammar.extend(_read_jsonl(fixture_dir / "blimp_minimal_pairs.jsonl"))
+    if is_large:
+        grammar.extend(build_large_blimp_probes(seed=seed))
+    else:
+        grammar.extend(_read_jsonl(fixture_dir / "blimp_minimal_pairs.jsonl"))
 
-    # MQAR & Copy splits
+    eff_mqar_eval = max(256, int(mqar_eval_per_setting)) if is_large else int(mqar_eval_per_setting)
+    eff_mqar_train = max(256, int(mqar_train_per_setting)) if is_large else int(mqar_train_per_setting)
     mqar_splits: Dict[int, Dict[str, List[MQARExample]]] = {}
     for kv in mqar_pairs:
         mqar_splits[int(kv)] = {
-            "train": generate_mqar_examples(mqar_train_per_setting, num_kv_pairs=int(kv), seed=seed),
-            "eval": generate_mqar_examples(mqar_eval_per_setting, num_kv_pairs=int(kv), seed=seed + 50_000),
+            "train": generate_mqar_examples(eff_mqar_train, num_kv_pairs=int(kv), seed=seed),
+            "eval": generate_mqar_examples(eff_mqar_eval, num_kv_pairs=int(kv), seed=seed + 50_000),
         }
+    copy_eval_n = 256 if is_large else 24
     copy_splits = {
-        "train": generate_exact_copy_examples(64, span_len=12, delay_len=24, seed=seed),
-        "eval": generate_exact_copy_examples(24, span_len=12, delay_len=24, seed=seed + 60_000),
+        "train": generate_exact_copy_examples(128 if is_large else 64, span_len=12, delay_len=24, seed=seed),
+        "eval": generate_exact_copy_examples(copy_eval_n, span_len=12, delay_len=24, seed=seed + 60_000),
     }
 
-    # Decisions & Routing grouped by split
-    dec_rows = _read_jsonl(fixture_dir / "intent_decisions.jsonl")
-    decisions: Dict[str, List[Dict[str, Any]]] = {}
-    for r in dec_rows:
-        decisions.setdefault(r["split"], []).append(r)
+    if is_large:
+        decisions = build_large_decision_suite(seed=seed)
+        routing = build_large_routing_suite(seed=seed)
+        domains, contradictions = build_large_continual_suite(seed=seed)
+    else:
+        dec_rows = _read_jsonl(fixture_dir / "intent_decisions.jsonl")
+        decisions = {}
+        for r in dec_rows:
+            decisions.setdefault(r["split"], []).append(r)
+        rt_rows = _read_jsonl(fixture_dir / "action_routing.jsonl")
+        routing = {}
+        for r in rt_rows:
+            routing.setdefault(r["split"], []).append(r)
+        domains = _read_jsonl(fixture_dir / "continual_domains.jsonl")
+        contradictions = _read_jsonl(fixture_dir / "contradictions.jsonl")
+
     assert_disjoint_splits(
         [r["id"] for r in decisions.get("val_cal", [])],
         [r["id"] for r in decisions.get("test_in_domain", [])]
         + [r["id"] for r in decisions.get("test_shifted_unseen", [])],
     )
-
-    rt_rows = _read_jsonl(fixture_dir / "action_routing.jsonl")
-    routing: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rt_rows:
-        routing.setdefault(r["split"], []).append(r)
     assert_disjoint_splits(
         [r["id"] for r in routing.get("val_cal", [])],
         [r["id"] for r in routing.get("test_eval", [])],
     )
 
-    domains = _read_jsonl(fixture_dir / "continual_domains.jsonl")
-    contradictions = _read_jsonl(fixture_dir / "contradictions.jsonl")
+    mqar_queries_per_setting = sum(len(ex.queries) for ex in mqar_splits[int(mqar_pairs[0])]["eval"])
+    item_counts = {
+        "scale": scale,
+        "lm_train_docs": len(lm_train),
+        "lm_val_cal_docs": len(lm_val),
+        "lm_test_eval_docs": len(lm_test),
+        "lm_train_utf8_bytes": int(unigram_stats["train_utf8_bytes"]),
+        "lm_test_eval_utf8_bytes": int(unigram_stats["test_utf8_bytes"]),
+        "grammar_probes": len(grammar),
+        "mqar_eval_sequences_per_kv": eff_mqar_eval,
+        "mqar_eval_queries_per_kv": mqar_queries_per_setting,
+        "mqar_eval_queries_total": sum(
+            sum(len(ex.queries) for ex in mqar_splits[int(kv)]["eval"]) for kv in mqar_pairs
+        ),
+        "copy_eval_sequences": copy_eval_n,
+        "copy_eval_tokens": copy_eval_n * 12,
+        "decision_train": len(decisions.get("train", [])),
+        "decision_val_cal": len(decisions.get("val_cal", [])),
+        "decision_test_in_domain": len(decisions.get("test_in_domain", [])),
+        "decision_test_shifted_unseen": len(decisions.get("test_shifted_unseen", [])),
+        "decision_test_total": len(decisions.get("test_in_domain", [])) + len(decisions.get("test_shifted_unseen", [])),
+        "routing_train": len(routing.get("train", [])),
+        "routing_val_cal": len(routing.get("val_cal", [])),
+        "routing_test_eval": len(routing.get("test_eval", [])),
+        "continual_domains": len(domains),
+        "continual_facts_total": sum(len(d.get("facts", [])) for d in domains),
+        "continual_distractors_total": sum(len(d.get("distractors", [])) for d in domains),
+        "contradiction_pairs": len(contradictions),
+    }
 
     return WorkloadBundle(
         status="ready",
         dataset_source=dataset_source,
+        corpus_metadata=corpus_metadata,
+        item_counts=item_counts,
         lm_train=lm_train,
         lm_val_cal=lm_val,
         lm_test_eval=lm_test,

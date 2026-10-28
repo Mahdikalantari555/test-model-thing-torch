@@ -53,8 +53,9 @@ class PureCEObjective(nn.Module):
         raw_embeds: torch.Tensor,
         pad_id: int,
         eos_id: int,
+        raw_hidden_states: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        del model, hidden_states, raw_embeds, eos_id
+        del model, hidden_states, raw_embeds, eos_id, raw_hidden_states
         ce = compute_shifted_ce(logits, input_ids, pad_id=pad_id)
         zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
         return {
@@ -76,8 +77,8 @@ class RepoFourLossObjective(nn.Module):
     def __init__(
         self,
         d_model: int,
-        lambda_var: float = 0.05,
-        lambda_pred: float = 0.05,
+        lambda_var: float = 0.08,
+        lambda_pred: float = 0.08,
         lambda_stop: float = 0.05,
     ) -> None:
         super().__init__()
@@ -97,15 +98,17 @@ class RepoFourLossObjective(nn.Module):
         raw_embeds: torch.Tensor,
         pad_id: int,
         eos_id: int,
+        raw_hidden_states: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         ce = compute_shifted_ce(logits, input_ids, pad_id=pad_id)
         if not self.training or input_ids.shape[1] < 2:
             zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
             return {"ce_loss": ce, "aux_loss": zero, "total_loss": ce}
 
+        z_src = raw_hidden_states if raw_hidden_states is not None else hidden_states
         valid_mask = (input_ids != int(pad_id)).float()
-        # 1. Per-token feature std hinge (matches src/model/rtu.py variance regularizer)
-        token_std = torch.sqrt(hidden_states.var(dim=-1, unbiased=False) + 1e-4)
+        # 1. Per-token feature std hinge on pre-norm residual stream (non-degenerate before RMSNorm!)
+        token_std = torch.sqrt(z_src.var(dim=-1, unbiased=False) + 1e-4)
         var_loss = (F.relu(1.0 - token_std) * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
 
         # 2. Next raw-embedding MSE with stop-gradient target
@@ -143,8 +146,11 @@ class RepoFourLossObjective(nn.Module):
 class EMALatentVICRegObjective(nn.Module):
     """`O3` (`ema_latent_vicreg`): Candidate C EMA next-chunk predictor + VICReg regularizer.
 
-    All predictor weights (`predictor`) and EMA target projections live strictly on this
-    objective module and are never invoked during `model.eval()` inference.
+    Applies BYOL/JEPA-style online projector (`target_proj`), EMA teacher projector
+    (`ema_target_proj`), and future-chunk predictor (`predictor`) directly to the
+    un-normalized backbone residual stream (`raw_hidden_states`), while regularizing
+    per-dimension variance (`std >= 1.0`) and off-diagonal covariance on `online_z`
+    so representation variance/decorrelation gradients flow cleanly into the core.
     """
 
     objective_id = "O3"
@@ -153,10 +159,10 @@ class EMALatentVICRegObjective(nn.Module):
         self,
         d_model: int,
         chunk_horizon: int = 8,
-        ema_decay: float = 0.996,
-        lambda_jepa: float = 0.05,
-        lambda_var: float = 0.04,
-        lambda_cov: float = 0.004,
+        ema_decay: float = 0.99,
+        lambda_jepa: float = 0.25,
+        lambda_var: float = 0.15,
+        lambda_cov: float = 0.05,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -166,15 +172,16 @@ class EMALatentVICRegObjective(nn.Module):
         self.lambda_var = float(lambda_var)
         self.lambda_cov = float(lambda_cov)
 
+        self.target_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.ema_target_proj = copy.deepcopy(self.target_proj)
+        for p in self.ema_target_proj.parameters():
+            p.requires_grad_(False)
+
         self.predictor = nn.Sequential(
             nn.Linear(self.d_model, self.d_model, bias=False),
             nn.SiLU(),
             nn.Linear(self.d_model, self.d_model, bias=False),
         )
-        self.target_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.ema_target_proj = copy.deepcopy(self.target_proj)
-        for p in self.ema_target_proj.parameters():
-            p.requires_grad_(False)
 
     def compute_loss(
         self,
@@ -186,6 +193,7 @@ class EMALatentVICRegObjective(nn.Module):
         raw_embeds: torch.Tensor,
         pad_id: int,
         eos_id: int,
+        raw_hidden_states: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         del model, raw_embeds, eos_id
         ce = compute_shifted_ce(logits, input_ids, pad_id=pad_id)
@@ -193,36 +201,34 @@ class EMALatentVICRegObjective(nn.Module):
             zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
             return {"ce_loss": ce, "aux_loss": zero, "total_loss": ce}
 
-        batch, seq_len, d = hidden_states.shape
+        z_src = raw_hidden_states if raw_hidden_states is not None else hidden_states
+        _, seq_len, d = z_src.shape
+        online_all = self.target_proj(z_src)  # (B, T, d)
         valid = input_ids != int(pad_id)
-        flat_h = hidden_states[valid]  # (N_valid, d)
+        flat_z = online_all[valid]  # (N_valid, d)
 
-        # VICReg variance + off-diagonal covariance across batch/time tokens
-        if flat_h.shape[0] > 4:
-            centered = flat_h - flat_h.mean(dim=0, keepdim=True)
+        # VICReg variance + off-diagonal covariance across batch/time projected latents
+        if flat_z.shape[0] > 4:
+            centered = flat_z - flat_z.mean(dim=0, keepdim=True)
             std_per_dim = torch.sqrt(centered.var(dim=0, unbiased=False) + 1e-4)
             var_loss = F.relu(1.0 - std_per_dim).mean()
-            cov = (centered.transpose(0, 1) @ centered) / float(flat_h.shape[0] - 1)
+            cov = (centered.transpose(0, 1) @ centered) / float(flat_z.shape[0] - 1)
             off_diag = cov - torch.diag(torch.diag(cov))
-            cov_loss = (off_diag.pow(2).sum()) / float(d * max(1, d - 1))
+            cov_loss = off_diag.pow(2).sum() / float(max(1, d))
         else:
             var_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
             cov_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
-        # Next-chunk latent cosine prediction against stop-grad EMA projection
+        # Next-chunk latent cosine prediction: predictor(online_z[t]) -> stop_grad(mean_{k=1..W} ema_z[t+k])
         w = min(self.chunk_horizon, max(1, seq_len // 2))
         if seq_len > w:
-            pred_z = self.predictor(hidden_states[:, :-w, :])  # (B, T - W, d)
+            pred_future = self.predictor(online_all[:, :-w, :])  # (B, T - W, d)
             with torch.no_grad():
-                ema_all = self.ema_target_proj(hidden_states.detach())  # (B, T, d)
-                # Sliding window mean of future W tokens [t+1 .. t+W]
+                ema_all = self.ema_target_proj(z_src.detach())  # (B, T, d)
                 ema_t = ema_all[:, 1:, :].transpose(1, 2)  # (B, d, T-1)
                 future_pool = F.avg_pool1d(ema_t, kernel_size=w, stride=1).transpose(1, 2)  # (B, T-W, d)
-            # Align student projection so target_proj receives clean representation gradients too
-            online_z = self.target_proj(hidden_states[:, :-w, :])
-            cos_pred = F.cosine_similarity(pred_z, future_pool.detach(), dim=-1)
-            cos_align = F.cosine_similarity(online_z[:, 1:, :], future_pool[:, :-1, :].detach(), dim=-1) if pred_z.shape[1] > 1 else cos_pred
-            jepa_loss = (1.0 - cos_pred).mean() + 0.25 * (1.0 - cos_align).mean()
+            cos_pred = F.cosine_similarity(pred_future, future_pool.detach(), dim=-1)
+            jepa_loss = (1.0 - cos_pred).mean()
         else:
             jepa_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 

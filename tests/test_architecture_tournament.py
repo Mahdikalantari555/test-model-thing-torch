@@ -196,3 +196,37 @@ def test_funnel_lr_sweep_bootstrap_stage1_stage2_stage3_and_stage4_loo() -> None
     )
     assert "short_conv4" in s4["kept_components"]
     assert s4["pruned_components"]["aux_ema_predictor"] == "O1_pure_ce"
+
+
+def test_large_workloads_item_counts_and_equal_non_embedding_param_matching(tmp_path):
+    """Verify scale='large' suites satisfy >=1,000 item rules and equal-non-embedding tokenizer matching."""
+    from src.model.cores.param_matcher import solve_core_config_non_embedding
+    from src.model.cores.registry import build_candidate_lm
+    from src.model.tournament.large_workloads import compute_corpus_unigram_bpb
+    from src.model.tournament.workloads import load_tournament_workloads
+
+    w = load_tournament_workloads(seed=1337, scale="large", fixture_dir=tmp_path)
+    assert w.item_counts["mqar_eval_queries_per_kv"] >= 1000
+    assert w.item_counts["decision_test_total"] >= 1000
+    assert w.item_counts["routing_test_eval"] >= 1000
+    assert w.item_counts["continual_facts_total"] >= 1000
+    assert w.item_counts["continual_distractors_total"] >= 200
+    assert w.item_counts["contradiction_pairs"] >= 200
+
+    bpb_stats = compute_corpus_unigram_bpb(
+        {"d1": "once upon a time there was a little cat who lived in a small house " * 8},
+        {"e1": "the little cat walked into the small house one sunny afternoon " * 4},
+    )
+    assert 3.0 <= bpb_stats["byte_unigram_bpb"] <= 8.0
+
+    cfg_256 = solve_core_config_non_embedding(
+        "C4", target_non_embedding_params=350_000, vocab_size=256
+    )
+    cfg_4096 = cfg_256.with_vocab_size(4096)
+    assert cfg_256.non_embedding_params == cfg_4096.non_embedding_params
+    m_256 = build_candidate_lm(cfg_256)
+    m_4096 = build_candidate_lm(cfg_4096)
+    ne_256 = sum(p.numel() for p in m_256.parameters()) - m_256.lm_head.weight.numel()
+    ne_4096 = sum(p.numel() for p in m_4096.parameters()) - m_4096.lm_head.weight.numel()
+    assert ne_256 == ne_4096 == cfg_256.non_embedding_params
+

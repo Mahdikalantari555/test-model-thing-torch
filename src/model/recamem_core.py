@@ -40,7 +40,7 @@ def validate_selected_core_manifest(manifest: Mapping[str, Any]) -> Dict[str, An
         raise ValueError(f"Unsupported manifest schema_version {manifest.get('schema_version')!r}; expected 1")
 
     status = str(manifest.get("selection_status", ""))
-    if status not in {"verified_winner", "provisional", "blocked"}:
+    if status not in {"verified_winner", "provisional", "provisional_core", "blocked"}:
         raise ValueError(f"Invalid selection_status {status!r}")
 
     for req_section in ("selected_architecture", "hyperparameters", "calibration", "tournament_provenance"):
@@ -65,6 +65,11 @@ def validate_selected_core_manifest(manifest: Mapping[str, Any]) -> Dict[str, An
             )
         if not prov.get("evidence_ledger_path"):
             raise ValueError("verified_winner manifest must record non-empty evidence_ledger_path")
+        if prov.get("target_17m_trained") is False:
+            raise ValueError(
+                "Cannot mark selection_status='verified_winner' when target_17m_trained is False; "
+                "use selection_status='provisional_core' until 17M training completes."
+            )
 
     arch = manifest["selected_architecture"]
     for slot in ("core_id", "tokenizer_id", "objective_id", "gradient_mode", "decision_readout_id", "router_id", "memory_arm_id", "architecture_mode"):

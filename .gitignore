@@ -1,4 +1,5 @@
 /.venv/
+/.cache/
 /typings/
 /wikipedia_clean/
 /CoLA/

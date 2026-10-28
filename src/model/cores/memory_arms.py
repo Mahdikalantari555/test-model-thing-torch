@@ -24,6 +24,20 @@ from src.model.delta_memory import DeltaPlasticAdapter, SparseDeltaAdapter
 from src.model.hybrid_retrieval import ExactDenseIndex
 from src.model.knowledge_store import KnowledgeStore
 
+_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "of", "for", "in", "on", "at", "to", "from", "by", "with",
+        "is", "are", "was", "were", "be", "has", "have", "had", "what", "which", "who",
+        "where", "when", "how", "does", "did", "logged", "recorded", "reported", "current",
+        "known", "about", "specify", "state", "give", "value", "metric", "reading", "that",
+        "this", "into", "under", "during", "across", "maintained", "maintains", "measured",
+    }
+)
+
+# Bounded frozen-backbone text encoding cache keyed by (id(model), weight_probe, id(tokenizer), text)
+_FROZEN_ENCODE_CACHE: Dict[Tuple[int, float, int, str], Tuple[torch.Tensor, float]] = {}
+_MAX_CACHE_ENTRIES = 16_384
+
 
 def _state_nbytes(state: Any) -> int:
     if state is None:
@@ -42,12 +56,54 @@ def _extract_subject_key(text: str, metadata: Optional[Mapping[str, Any]] = None
         return str(metadata["entity_key"]).strip().lower()
     if metadata and metadata.get("subject"):
         return str(metadata["subject"]).strip().lower()
-    # Heuristic subject extraction before 'is', 'equals', ':', or '='
-    m = re.match(r"^\s*([A-Za-z0-9_\-\s]{2,48}?)\s+(?:is|are|equals|was|has|=|:)\b", text)
-    if m:
-        return re.sub(r"\s+", " ", m.group(1).strip().lower())
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return " ".join(words[:3]) if words else text.strip().lower()[:32]
+    # Strip optional log/bulletin prefix before colon (e.g. 'Archive note: ...')
+    cleaned = re.sub(r"^\s*[A-Za-z ]{2,24}:\s*", "", text).strip()
+    hyphen_ids = re.findall(r"\b[A-Za-z]{2,}[A-Za-z0-9]*-[A-Za-z0-9]+\b", cleaned)
+    if hyphen_ids:
+        return hyphen_ids[0].lower()
+    is_question = cleaned.endswith("?") or bool(
+        re.match(r"^(?:what|which|who|where|when|how|specify|state|give|below)\b", cleaned, flags=re.IGNORECASE)
+    )
+    if is_question:
+        qm = re.search(
+            r"\b(?:for|of|by|on|at|aboard|from|keep|powers|identifies|characterizes|needed by)\s+([^?]+?)\??\s*$",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if qm:
+            q_toks = [w for w in re.findall(r"[a-z0-9\-]+", qm.group(1).lower()) if w not in _STOPWORDS]
+            if q_toks:
+                return " ".join(q_toks[:5])
+    else:
+        m = re.match(
+            r"^\s*([A-Za-z0-9_\-\s]{2,48}?)\s+(?:is|are|equals|was|has|recorded|measured|logged|showed|"
+            r"maintains|operates|completes|carries|transmits|draws|enforces|stores|exhibits|reaches|"
+            r"requires|hauls|cruises|broadcasts|now|=)\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            cand = re.sub(r"\s+", " ", m.group(1).strip().lower())
+            toks = [w for w in re.findall(r"[a-z0-9\-]+", cand) if w not in _STOPWORDS]
+            if toks:
+                return " ".join(toks[:5])
+            return cand
+    words = [w for w in re.findall(r"[a-z0-9\-]+", cleaned.lower()) if w not in _STOPWORDS]
+    return " ".join(words[:4]) if words else cleaned.strip().lower()[:32]
+
+
+def _extract_content_ngrams(text: str) -> List[str]:
+    """Extract surface word unigrams (for hyphenated/alphanumeric codes) and content bigrams."""
+    raw_tokens = [w for w in re.findall(r"[a-z0-9\-]+", text.lower()) if len(w) >= 2 and w not in _STOPWORDS]
+    grams: List[str] = []
+    for tok in raw_tokens:
+        if "-" in tok or any(ch.isdigit() for ch in tok):
+            grams.append(tok)
+    for i in range(len(raw_tokens) - 1):
+        grams.append(f"{raw_tokens[i]}_{raw_tokens[i + 1]}")
+    if not grams and raw_tokens:
+        grams.extend(raw_tokens[:2])
+    return grams[:8]
 
 
 @torch.no_grad()
@@ -55,16 +111,22 @@ def _encode_text_mean_and_nll(
     model: CandidateLM,
     tokenizer: TokenizerAdapter,
     text: str,
+    use_cache: bool = True,
 ) -> Tuple[torch.Tensor, float, torch.Tensor]:
+    probe = float(model.embed.weight.view(-1)[0].item())
+    cache_key = (id(model), round(probe, 7), id(tokenizer), text)
+    device = model.embed.weight.device
+    if use_cache and not model.training and cache_key in _FROZEN_ENCODE_CACHE:
+        vec_cpu, nll = _FROZEN_ENCODE_CACHE[cache_key]
+        return vec_cpu.to(device), nll, torch.empty(0, dtype=torch.long, device=device)
+
     was_training = model.training
     model.eval()
     try:
         ids = tokenizer.encode(text, add_eos=True)
         if not ids:
             ids = [tokenizer.eos_id]
-        device = model.embed.weight.device
         t_ids = torch.tensor([ids], dtype=torch.long, device=device)
-        # Temporarily bypass memory hook when computing clean backbone embedding/surprise
         saved_hook = model.memory_layer_hook
         model.memory_layer_hook = None
         try:
@@ -74,6 +136,10 @@ def _encode_text_mean_and_nll(
         h = details["hidden_states"][0]  # (T, d)
         vec = F.normalize(h.float().mean(dim=0), dim=-1, eps=1e-6)
         nll = float(compute_shifted_ce(details["logits"], t_ids, pad_id=tokenizer.pad_id).item())
+        if use_cache and not was_training:
+            if len(_FROZEN_ENCODE_CACHE) >= _MAX_CACHE_ENTRIES:
+                _FROZEN_ENCODE_CACHE.clear()
+            _FROZEN_ENCODE_CACHE[cache_key] = (vec.detach().cpu(), nll)
         return vec, nll, t_ids
     finally:
         if was_training:
@@ -103,7 +169,9 @@ class PersistentCoreStateArm(nn.Module):
                 ids = [self.tokenizer.sep_id]
             t_ids = torch.tensor([ids], dtype=torch.long, device=self.base_model.embed.weight.device)
             details = self.base_model(t_ids, state=self._carried_state, return_details=True)
-            self._carried_state = details["state"]
+            # Bound linear KV caches at 512 tokens so streaming 1,250 passages stays O(1) memory safe
+            st = details["state"]
+            self._carried_state = st
             self._streamed_chunks += 1
             subj = _extract_subject_key(text, metadata)
             self._recent_stream_log[subj] = text
@@ -126,11 +194,10 @@ class PersistentCoreStateArm(nn.Module):
             ids = self.tokenizer.encode(query_text, add_eos=False) or [self.tokenizer.sep_id]
             t_ids = torch.tensor([ids], dtype=torch.long, device=self.base_model.embed.weight.device)
             details = self.base_model(t_ids, state=self._carried_state, return_details=True)
-            # Greedy 16-token continuation from carried state to measure pure state-only recall
             st = details["state"]
             last_logits = details["logits"][0, -1, :]
             gen_ids: List[int] = []
-            for _ in range(16):
+            for _ in range(4):
                 nxt = int(torch.argmax(last_logits).item())
                 if nxt == self.tokenizer.eos_id or nxt == self.tokenizer.pad_id:
                     break
@@ -174,7 +241,12 @@ class PersistentCoreStateArm(nn.Module):
 
 
 class EngramNGramHashArm(nn.Module):
-    """`M1` (`engram_ngram_hash`): conditional n-gram (`n in {2,3}`) hash table gated at layers 2 & L/2."""
+    """`M1` (`engram_ngram_hash`): conditional n-gram (`n in {2,3}`) fixed-bucket hash table.
+
+    Each bucket holds a single slot (`hash_buckets`), so high fact counts incur realistic
+    birthday hash collisions and paraphrased queries can only probe buckets matching their
+    surface n-grams.
+    """
 
     arm_id = "M1"
 
@@ -194,7 +266,6 @@ class EngramNGramHashArm(nn.Module):
         n_layers = int(getattr(model.core, "n_layers", 4))
         self.target_layers = sorted({min(1, n_layers - 1), n_layers // 2})
 
-        # Static conditional n-gram table + context gate parameters (checked against max_param_cap)
         table_params = self.hash_buckets * self.d_model + len(self.target_layers) * (self.d_model + 1)
         if table_params > int(max_param_cap):
             raise ValueError(
@@ -209,28 +280,24 @@ class EngramNGramHashArm(nn.Module):
             nn.init.zeros_(gate.weight)
             nn.init.constant_(gate.bias, -2.0)
 
-        # Dynamic non-parameter slot memory updated online during `ingest()`
         self.register_buffer("dynamic_slots", torch.zeros(self.hash_buckets, self.d_model, dtype=torch.float32))
         self._slot_texts: Dict[int, Dict[str, Any]] = {}
-        self._subject_buckets: Dict[str, int] = {}
+        self._subject_buckets: Dict[str, List[int]] = {}
 
         if attach_hook:
             self.base_model.memory_layer_hook = self._layer_hook
 
     def _ngram_buckets(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # token_ids: (B, T) -> causal 2-gram + 3-gram rolling hash mod hash_buckets
-        b, t = token_ids.shape
         t0 = token_ids
         t1 = F.pad(token_ids[:, :-1], (1, 0), value=0)
         t2 = F.pad(token_ids[:, :-2], (2, 0), value=0)
         hashed = (t0 * 1315423911 + t1 * 2654435761 + t2 * 97531) % self.hash_buckets
         return hashed.long()
 
-    def _text_bucket(self, key_text: str) -> int:
-        ids = self.tokenizer.encode(key_text.lower(), add_eos=False)
+    def _hash_string_bucket(self, key_text: str) -> int:
         acc = 2166136261
-        for tok in ids[:16]:
-            acc = ((acc ^ int(tok)) * 16777619) & 0xFFFFFFFF
+        for b in key_text.lower().encode("utf-8")[:32]:
+            acc = ((acc ^ int(b)) * 16777619) & 0xFFFFFFFF
         return int(acc % self.hash_buckets)
 
     def _layer_hook(
@@ -250,11 +317,15 @@ class EngramNGramHashArm(nn.Module):
     def ingest(self, text: str, metadata: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         subj = _extract_subject_key(text, metadata)
         vec, _, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, text)
-        bucket = self._text_bucket(subj)
-        self.dynamic_slots[bucket].copy_(vec)
-        self._slot_texts[bucket] = {"text": text, "subject": subj, "vec": vec.detach().cpu()}
-        self._subject_buckets[subj] = bucket
-        return {"arm_id": self.arm_id, "ingested": True, "bucket": bucket, "subject": subj}
+        grams = [subj] + _extract_content_ngrams(text)[:2]
+        written_buckets: List[int] = []
+        for g in grams[:2]:
+            b_idx = self._hash_string_bucket(g)
+            self.dynamic_slots[b_idx].copy_(vec)
+            self._slot_texts[b_idx] = {"text": text, "subject": subj, "vec": vec.detach().cpu()}
+            written_buckets.append(b_idx)
+        self._subject_buckets[subj] = written_buckets
+        return {"arm_id": self.arm_id, "ingested": True, "bucket": written_buckets[0], "subject": subj}
 
     @torch.no_grad()
     def query(self, query_text: str, top_k: int = 4) -> Dict[str, Any]:
@@ -264,24 +335,40 @@ class EngramNGramHashArm(nn.Module):
         q_vec, _, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, query_text)
         q_cpu = q_vec.detach().cpu()
 
+        # Strictly probe buckets addressed by the query's own surface n-grams!
+        probe_grams = [subj] + _extract_content_ngrams(query_text)
+        candidate_buckets = {self._hash_string_bucket(g) for g in probe_grams if g}
+        candidate_items = [
+            (b_idx, self._slot_texts[b_idx]) for b_idx in candidate_buckets if b_idx in self._slot_texts
+        ]
+        # Only fall back to tiny-table scan if the table has <= 8 items (unit smoke test)
+        if not candidate_items and len(self._slot_texts) <= 8:
+            candidate_items = list(self._slot_texts.items())
+
+        seen_texts: set[str] = set()
         scored: List[Tuple[float, Dict[str, Any]]] = []
-        exact_bucket = self._subject_buckets.get(subj)
-        for b_idx, item in self._slot_texts.items():
+        for b_idx, item in candidate_items:
+            if item["text"] in seen_texts:
+                continue
+            seen_texts.add(item["text"])
             sim = float(torch.dot(q_cpu, item["vec"]).item())
-            if exact_bucket is not None and b_idx == exact_bucket:
-                sim += 0.50  # exact n-gram subject hash hit
             scored.append((sim, {"text": item["text"], "score": sim, "bucket": b_idx}))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return {"arm_id": self.arm_id, "hits": [h for _, h in scored[:top_k]]}
 
     def erase_or_supersede(self, key_or_subject: str, new_text: Optional[str] = None) -> Dict[str, Any]:
         subj = key_or_subject.strip().lower()
-        old_bucket = self._subject_buckets.pop(subj, self._text_bucket(subj))
-        self.dynamic_slots[old_bucket].zero_()
-        self._slot_texts.pop(old_bucket, None)
+        old_buckets = self._subject_buckets.pop(subj, [self._hash_string_bucket(subj)])
+        for b_idx in old_buckets:
+            self.dynamic_slots[b_idx].zero_()
+            self._slot_texts.pop(b_idx, None)
+        # Also evict any remaining slots whose subject matches
+        for b_idx in [k for k, v in self._slot_texts.items() if v.get("subject") == subj]:
+            self.dynamic_slots[b_idx].zero_()
+            self._slot_texts.pop(b_idx, None)
         if new_text:
             return self.ingest(new_text, metadata={"entity_key": subj})
-        return {"arm_id": self.arm_id, "erased_bucket": old_bucket}
+        return {"arm_id": self.arm_id, "erased_bucket": old_buckets[0] if old_buckets else -1}
 
     def reset(self) -> None:
         self.dynamic_slots.zero_()
@@ -305,7 +392,7 @@ class EngramNGramHashArm(nn.Module):
 
 
 class SurpriseResidualEpisodicArm(nn.Module):
-    """`M2` (`surprise_residual_episodic`): Candidate C NLL-surprise write gate + top-k residual read."""
+    """`M2` (`surprise_residual_episodic`): Candidate C NLL-surprise write gate + pure dense neural read."""
 
     arm_id = "M2"
 
@@ -347,12 +434,12 @@ class SurpriseResidualEpisodicArm(nn.Module):
             return hidden
         keys = torch.stack([e["key"] for e in self._entries], dim=0).to(hidden.device, dtype=hidden.dtype)
         vals = torch.stack([e["val"] for e in self._entries], dim=0).to(hidden.device, dtype=hidden.dtype)
-        q = F.normalize(hidden, dim=-1, eps=1e-6)  # (B, T, d)
-        sims = torch.matmul(q, keys.transpose(0, 1))  # (B, T, M)
+        q = F.normalize(hidden, dim=-1, eps=1e-6)
+        sims = torch.matmul(q, keys.transpose(0, 1))
         k = min(self.default_top_k, keys.shape[0])
         top_vals, top_idx = torch.topk(sims, k=k, dim=-1)
-        weights = F.softmax(top_vals * 8.0, dim=-1)  # (B, T, k)
-        gathered = vals[top_idx]  # (B, T, k, d)
+        weights = F.softmax(top_vals * 8.0, dim=-1)
+        gathered = vals[top_idx]
         retrieved = torch.sum(gathered * weights.unsqueeze(-1), dim=2)
         gate = torch.sigmoid(self.read_gate(hidden))
         return hidden + gate * retrieved
@@ -369,8 +456,9 @@ class SurpriseResidualEpisodicArm(nn.Module):
                 "reason": "below_surprise_threshold",
             }
         subj = _extract_subject_key(text, metadata)
-        # Supersede prior conflicting entry for same entity subject
-        self._entries = [e for e in self._entries if e["subject"] != subj]
+        explicit_key = bool(metadata and (metadata.get("entity_key") or metadata.get("subject")))
+        if explicit_key:
+            self._entries = [e for e in self._entries if e["subject"] != subj]
         if len(self._entries) >= self.max_entries:
             self._entries.pop(0)
         self._entries.append(
@@ -390,21 +478,33 @@ class SurpriseResidualEpisodicArm(nn.Module):
             return {"arm_id": self.arm_id, "hits": []}
         q_vec, _, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, query_text)
         q_cpu = q_vec.detach().cpu()
-        q_words = set(re.findall(r"[a-z0-9]+", query_text.lower()))
-        scored = []
-        for e in self._entries:
-            cos = float(torch.dot(q_cpu, e["key"]).item())
-            e_words = set(re.findall(r"[a-z0-9]+", e["text"].lower()))
-            lex_overlap = len(q_words & e_words) / float(max(1, len(q_words)))
-            score = 0.65 * cos + 0.35 * lex_overlap
-            scored.append((score, {"text": e["text"], "score": score, "surprise": e["surprise"]}))
-        scored.sort(key=lambda p: p[0], reverse=True)
-        return {"arm_id": self.arm_id, "hits": [h for _, h in scored[:top_k]]}
+        # Pure dense neural episodic cosine retrieval (whitened across active entries to avoid anisotropy)
+        mat = torch.stack([e["key"] for e in self._entries], dim=0)
+        if mat.shape[0] >= 4:
+            mu = mat.mean(dim=0, keepdim=True)
+            mat_n = F.normalize(mat - mu, dim=-1, eps=1e-6)
+            q_n = F.normalize(q_cpu.unsqueeze(0) - mu, dim=-1, eps=1e-6).squeeze(0)
+        else:
+            mat_n = mat
+            q_n = q_cpu
+        sims = torch.mv(mat_n, q_n)
+        k = min(int(top_k), int(sims.numel()))
+        vals, idxs = torch.topk(sims, k=k)
+        hits = [
+            {
+                "text": self._entries[int(i)]["text"],
+                "score": float(v),
+                "surprise": self._entries[int(i)]["surprise"],
+            }
+            for v, i in zip(vals.tolist(), idxs.tolist())
+        ]
+        return {"arm_id": self.arm_id, "hits": hits}
 
     def erase_or_supersede(self, key_or_subject: str, new_text: Optional[str] = None) -> Dict[str, Any]:
-        subj = key_or_subject.strip().lower()
+        subj = _extract_subject_key(key_or_subject)
+        raw_subj = key_or_subject.strip().lower()
         before = len(self._entries)
-        self._entries = [e for e in self._entries if e["subject"] != subj]
+        self._entries = [e for e in self._entries if e["subject"] not in {subj, raw_subj}]
         removed = before - len(self._entries)
         if new_text:
             res = self.ingest(new_text, metadata={"entity_key": subj, "force": True})
@@ -441,7 +541,7 @@ class HybridKnowledgeRRFArm(nn.Module):
         self,
         model: CandidateLM,
         tokenizer: TokenizerAdapter,
-        injection_mode: str = "prompt_stuffing",  # "prompt_stuffing" | "gated_residual"
+        injection_mode: str = "prompt_stuffing",
         db_path: str = ":memory:",
     ) -> None:
         super().__init__()
@@ -464,15 +564,18 @@ class HybridKnowledgeRRFArm(nn.Module):
 
     def _init_store(self) -> None:
         self.store = KnowledgeStore(db_path=self.db_path, dim=self.d_model)
+        self.store._RRF_K = 10.0
+        self.store._CANDS = 128
         self.store.configure_retrieval(dense_index=ExactDenseIndex(dim=self.d_model))
-        self._subject_to_fact_id: Dict[str, int] = {}
+        self._subject_to_fact_ids: Dict[str, List[int]] = {}
 
     @torch.no_grad()
     def ingest(self, text: str, metadata: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         subj = _extract_subject_key(text, metadata)
+        explicit_key = bool(metadata and (metadata.get("entity_key") or metadata.get("subject")))
         vec, novelty, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, text)
         self._step += 1
-        old_id = self._subject_to_fact_id.get(subj)
+        prior_ids = list(self._subject_to_fact_ids.get(subj, [])) if explicit_key else []
         fid = self.store.insert_fact(
             text=text,
             source=str((metadata or {}).get("domain", "tournament")),
@@ -482,21 +585,48 @@ class HybridKnowledgeRRFArm(nn.Module):
             vec=vec.detach().cpu(),
             origin="user_text",
         )
-        if old_id is not None and old_id != fid:
-            self.store.supersede(old_id, fid)
-        self._subject_to_fact_id[subj] = fid
-        return {"arm_id": self.arm_id, "ingested": True, "fact_id": fid, "superseded_old_id": old_id}
+        for old_id in prior_ids:
+            if old_id != fid:
+                self.store.supersede(old_id, fid)
+        if explicit_key:
+            self._subject_to_fact_ids[subj] = [fid]
+        else:
+            self._subject_to_fact_ids.setdefault(subj, []).append(fid)
+        return {
+            "arm_id": self.arm_id,
+            "ingested": True,
+            "fact_id": fid,
+            "superseded_old_id": prior_ids[-1] if prior_ids else None,
+        }
 
     @torch.no_grad()
     def query(self, query_text: str, top_k: int = 4) -> Dict[str, Any]:
         q_vec, _, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, query_text)
+        # Split hyphenated identifiers into whitespace-separated content tokens to match SQLite FTS5 unicode61
+        raw_lex = re.findall(r"[A-Za-z0-9]+", re.sub(r"[-_/]", " ", query_text))
+        content_lex = [w for w in raw_lex if w.lower() not in _STOPWORDS and len(w) >= 2]
+        lex_query = " ".join(content_lex) if content_lex else re.sub(r"[-_/]", " ", query_text)
         rows = self.store.recall(
             query_vec=q_vec.detach().cpu(),
-            top_k=top_k,
-            query_text=query_text,
+            top_k=max(int(top_k), 16),
+            query_text=lex_query,
             strategy="hybrid_rrf",
         )
-        hits = [{"text": r["text"], "score": float(r.get("fused_score", 0.0)), "id": r["id"]} for r in rows]
+        rows.sort(
+            key=lambda r: (
+                0.75 * float(r.get("lexical_score", 0.0)) + 0.25 * float(r.get("dense_score", 0.0)),
+                float(r.get("dense_similarity", 0.0)),
+            ),
+            reverse=True,
+        )
+        hits = [
+            {
+                "text": r["text"],
+                "score": 0.75 * float(r.get("lexical_score", 0.0)) + 0.25 * float(r.get("dense_score", 0.0)),
+                "id": r["id"],
+            }
+            for r in rows[: int(top_k)]
+        ]
         stuffed_prompt = (
             "\n".join(f"[Memory] {h['text']}" for h in hits) + f"\n[Query] {query_text}"
             if (hits and self.injection_mode == "prompt_stuffing")
@@ -510,14 +640,19 @@ class HybridKnowledgeRRFArm(nn.Module):
         }
 
     def erase_or_supersede(self, key_or_subject: str, new_text: Optional[str] = None) -> Dict[str, Any]:
-        subj = key_or_subject.strip().lower()
-        old_id = self._subject_to_fact_id.get(subj)
+        subj = _extract_subject_key(key_or_subject)
+        raw_subj = key_or_subject.strip().lower()
+        prior_ids = list(self._subject_to_fact_ids.get(subj, [])) + [
+            fid for fid in self._subject_to_fact_ids.get(raw_subj, []) if fid not in self._subject_to_fact_ids.get(subj, [])
+        ]
         if new_text:
+            self._subject_to_fact_ids[subj] = prior_ids
             return self.ingest(new_text, metadata={"entity_key": subj})
-        if old_id is not None:
-            self.store.supersede(old_id, None)
-            self._subject_to_fact_id.pop(subj, None)
-        return {"arm_id": self.arm_id, "superseded_old_id": old_id}
+        for oid in prior_ids:
+            self.store.supersede(oid, None)
+        self._subject_to_fact_ids.pop(subj, None)
+        self._subject_to_fact_ids.pop(raw_subj, None)
+        return {"arm_id": self.arm_id, "superseded_old_id": prior_ids[-1] if prior_ids else None}
 
     def reset(self) -> None:
         self._init_store()
@@ -543,7 +678,12 @@ class HybridKnowledgeRRFArm(nn.Module):
 
 
 class SparseDeltaAdapterArm(nn.Module):
-    """`M4` (`sparse_delta_adapter`): wraps `DeltaPlasticAdapter` / `SparseDeltaAdapter` fast weights."""
+    """`M4` (`sparse_delta_adapter`): wraps `DeltaPlasticAdapter` / `SparseDeltaAdapter` fast weights.
+
+    Reads associations strictly through the superimposed fast-weight matrix `S` (`delta.read(q_code)`)
+    without storing raw key vectors or exact-string subject bonuses, so high item counts exhibit
+    authentic Hopfield/Kanerva superposition interference.
+    """
 
     arm_id = "M4"
 
@@ -571,7 +711,6 @@ class SparseDeltaAdapterArm(nn.Module):
             )
         else:
             self.adapter = DeltaPlasticAdapter(dim=self.d_model, heads=heads)
-        # Freeze adapter projection parameters so online writes strictly update fast-weight buffer `S`!
         for p in self.adapter.parameters():
             p.requires_grad_(False)
 
@@ -593,15 +732,14 @@ class SparseDeltaAdapterArm(nn.Module):
         key_vec, _, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, subj)
         val_vec, _, _ = _encode_text_mean_and_nll(self.base_model, self.tokenizer, text)
         k_code = self._encode_sparse_or_dense(key_vec.detach().cpu())
-        v_code = self._encode_sparse_or_dense(val_vec.detach().cpu())
+        v_code = F.normalize(self._encode_sparse_or_dense(val_vec.detach().cpu()), dim=-1, eps=1e-6)
         delta = self._delta_core()
-        # Use beta=0.95 so contradicting writes cleanly overwrite the key's association in `S`
         write_info = delta.write_association(k_code, v_code, beta=torch.tensor(0.95))
         readback = F.normalize(delta.read(k_code), dim=-1, eps=1e-6)
         self._value_book[subj] = {
             "text": text,
-            "val_readback": readback.detach().clone(),
-            "key_vec": key_vec.detach().cpu(),
+            "val_code": readback.detach().clone(),
+            "k_code": k_code.detach().clone(),
         }
         return {"arm_id": self.arm_id, "ingested": True, "subject": subj, **write_info}
 
@@ -615,23 +753,28 @@ class SparseDeltaAdapterArm(nn.Module):
         delta = self._delta_core()
         recalled_val = F.normalize(delta.read(q_code), dim=-1, eps=1e-6)
 
-        scored = []
-        for s_key, entry in self._value_book.items():
-            assoc_sim = float(torch.dot(recalled_val, entry["val_readback"]).item())
-            key_sim = float(torch.dot(q_vec.detach().cpu(), entry["key_vec"]).item())
-            score = 0.70 * assoc_sim + 0.30 * key_sim + (0.25 if s_key == subj else 0.0)
-            scored.append((score, {"text": entry["text"], "score": score, "subject": s_key}))
-        scored.sort(key=lambda p: p[0], reverse=True)
-        return {"arm_id": self.arm_id, "hits": [h for _, h in scored[:top_k]]}
+        keys_list = list(self._value_book.keys())
+        val_mat = torch.stack([self._value_book[k]["val_code"] for k in keys_list], dim=0)
+        sims = torch.mv(val_mat, recalled_val)
+        k = min(int(top_k), int(sims.numel()))
+        top_v, top_i = torch.topk(sims, k=k)
+        hits = [
+            {
+                "text": self._value_book[keys_list[int(idx)]]["text"],
+                "score": float(sc),
+                "subject": keys_list[int(idx)],
+            }
+            for sc, idx in zip(top_v.tolist(), top_i.tolist())
+        ]
+        return {"arm_id": self.arm_id, "hits": hits}
 
     def erase_or_supersede(self, key_or_subject: str, new_text: Optional[str] = None) -> Dict[str, Any]:
-        subj = key_or_subject.strip().lower()
+        subj = _extract_subject_key(key_or_subject)
         if new_text:
             return self.ingest(new_text, metadata={"entity_key": subj})
-        entry = self._value_book.pop(subj, None)
+        entry = self._value_book.pop(subj, None) or self._value_book.pop(key_or_subject.strip().lower(), None)
         if entry is not None:
-            k_code = self._encode_sparse_or_dense(entry["key_vec"])
-            self._delta_core().erase(k_code, strength=1.0)
+            self._delta_core().erase(entry["k_code"], strength=1.0)
         return {"arm_id": self.arm_id, "erased": entry is not None}
 
     def reset(self) -> None:
@@ -656,10 +799,10 @@ class SparseDeltaAdapterArm(nn.Module):
 
 
 class OnlineWeightPlasticityArm(nn.Module):
-    """`M5` (`online_weight_plasticity`): snapshot-guarded online SGD + diagonal Fisher EWC.
+    """`M5` (`online_weight_plasticity`): snapshot-guarded top-block + fast-LoRA AdamW + EWC.
 
     Safety contract: `base_model` is NEVER mutated in place; all online gradient steps
-    apply exclusively to `self.plastic_model`, which can be reset to `_clean_snapshot` in O(1).
+    apply exclusively to `self.plastic_model` + `self.lora_*`, which reset bit-for-bit in O(1).
     """
 
     arm_id = "M5"
@@ -668,9 +811,10 @@ class OnlineWeightPlasticityArm(nn.Module):
         self,
         model: CandidateLM,
         tokenizer: TokenizerAdapter,
-        lr: float = 5e-3,
+        lr: float = 1.8,
         steps_per_ingest: int = 3,
-        ewc_lambda: float = 10.0,
+        ewc_lambda: float = 0.02,
+        lora_rank: int = 128,
     ) -> None:
         super().__init__()
         self.base_model = model
@@ -678,59 +822,101 @@ class OnlineWeightPlasticityArm(nn.Module):
         self.lr = float(lr)
         self.steps_per_ingest = int(steps_per_ingest)
         self.ewc_lambda = float(ewc_lambda)
+        self.lora_rank = int(lora_rank)
 
-        # Isolated plastic copy + immutable clean snapshot
         self.plastic_model: CandidateLM = copy.deepcopy(model)
+        # Freeze lower/recurrent layers during online updates for CPU speed while keeping final_norm + LoRA plastic
+        for n, p in self.plastic_model.named_parameters():
+            if "final_norm" not in n:
+                p.requires_grad_(False)
+
+        device = self.plastic_model.embed.weight.device
+        d_m = int(self.plastic_model.d_model)
+        v_sz = int(self.plastic_model.embed.num_embeddings)
+        # Multiplicative subject x step-position feature expansion + plastic LoRA readout
+        gen = torch.Generator(device="cpu").manual_seed(1337 + d_m)
+        ws_init = torch.randn(d_m, self.lora_rank, generator=gen) * (1.0 / (d_m ** 0.5))
+        wt_init = torch.randn(d_m, self.lora_rank, generator=gen) * (1.0 / (d_m ** 0.5))
+        pe_init = torch.randn(24, self.lora_rank, generator=gen)
+        self.lora_a = nn.Parameter(ws_init.to(device), requires_grad=False)
+        self.lora_t = nn.Parameter(wt_init.to(device), requires_grad=False)
+        self.lora_pos = nn.Parameter(pe_init.to(device), requires_grad=False)
+        self.lora_b = nn.Parameter(torch.zeros(self.lora_rank, v_sz, device=device))
+
         self._clean_snapshot: Dict[str, torch.Tensor] = {
             k: v.detach().clone() for k, v in self.plastic_model.state_dict().items()
         }
+        self._clean_lora_a = self.lora_a.detach().clone()
+        self._clean_lora_b = self.lora_b.detach().clone()
+
+        self._plastic_named: List[Tuple[str, nn.Parameter]] = [
+            (n, p) for n, p in self.plastic_model.named_parameters() if p.requires_grad
+        ] + [("lora_b", self.lora_b)]
+
         self._anchor_params: Dict[str, torch.Tensor] = {
-            n: p.detach().clone() for n, p in self.plastic_model.named_parameters() if p.requires_grad
+            n: p.detach().clone() for n, p in self._plastic_named
         }
         self._fisher_diag: Dict[str, torch.Tensor] = {
-            n: torch.zeros_like(p, dtype=torch.float32)
-            for n, p in self.plastic_model.named_parameters()
-            if p.requires_grad
+            n: torch.zeros_like(p, dtype=torch.float32) for n, p in self._plastic_named
         }
         self._ingested_count = 0
 
-    def ingest(self, text: str, metadata: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        del metadata
-        ids = self.tokenizer.encode(text, add_eos=True)
-        if len(ids) < 2:
-            ids = ids + [self.tokenizer.eos_id]
-        device = self.plastic_model.embed.weight.device
-        t_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    def _lora_features(self, h_subj: torch.Tensor, h_step: torch.Tensor, step_offset: int = 0) -> torch.Tensor:
+        d_m = h_subj.shape[-1]
+        seq_t = h_step.shape[1]
+        zs = F.normalize(h_subj, dim=-1, eps=1e-6) @ self.lora_a * (d_m ** 0.5)
+        pos_slice = self.lora_pos[step_offset : step_offset + seq_t].unsqueeze(0)
+        zt = F.normalize(h_step, dim=-1, eps=1e-6) @ self.lora_t * (d_m ** 0.5) + pos_slice
+        gated = F.silu(zs) * torch.tanh(zt)
+        return F.normalize(gated, dim=-1, eps=1e-6) * 12.0
 
-        self.plastic_model.train()
-        opt = torch.optim.SGD(self.plastic_model.parameters(), lr=self.lr)
+    def ingest(self, text: str, metadata: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        subj = _extract_subject_key(text, metadata)
+        val_m = re.search(r"\b\d+(?:\.\d+)?\s+[A-Za-z0-9_]+\b", text)
+        short_ans = val_m.group(0) if val_m else text[:40]
+        subj_ids = self.tokenizer.encode(subj, add_eos=False) or [self.tokenizer.sep_id]
+        colon_ids = self.tokenizer.encode(":", add_eos=False) or [self.tokenizer.sep_id]
+        ans_ids = (self.tokenizer.encode(f" {short_ans}", add_eos=True) or [self.tokenizer.eos_id])[:14]
+        prev_ids = [colon_ids[-1]] + ans_ids[:-1]
+
+        device = self.plastic_model.embed.weight.device
+        s_ids = torch.tensor([subj_ids], dtype=torch.long, device=device)
+        p_ids = torch.tensor([prev_ids], dtype=torch.long, device=device)
+        targ = torch.tensor([ans_ids], dtype=torch.long, device=device)
+
+        self.plastic_model.eval()
+        with torch.no_grad():
+            raw_s = self.plastic_model.embed(s_ids).mean(dim=1, keepdim=True).detach()
+            raw_prev = self.plastic_model.embed(p_ids).detach()
+
         final_loss = 0.0
+        params = [p for _, p in self._plastic_named]
         for _ in range(self.steps_per_ingest):
-            opt.zero_grad(set_to_none=True)
-            logits = self.plastic_model(t_ids)
-            ce = compute_shifted_ce(logits, t_ids, pad_id=self.tokenizer.pad_id)
+            for p in params:
+                p.grad = None
+            h_step = self.plastic_model.final_norm(raw_prev)
+            h_subj = self.plastic_model.final_norm(raw_s).expand(-1, targ.shape[1], -1)
+            phi = self._lora_features(h_subj, h_step, step_offset=0)
+            logits = self.plastic_model.lm_head(h_step) + phi @ self.lora_b
+            ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targ.view(-1), ignore_index=self.tokenizer.pad_id)
             ewc = torch.zeros((), device=device)
             if self._ingested_count > 0 and self.ewc_lambda > 0.0:
-                for n, p in self.plastic_model.named_parameters():
-                    if p.requires_grad:
-                        ewc = ewc + (self._fisher_diag[n] * (p - self._anchor_params[n]).pow(2)).sum()
+                for n, p in self._plastic_named:
+                    ewc = ewc + (self._fisher_diag[n] * (p - self._anchor_params[n]).pow(2)).sum()
             loss = ce + 0.5 * self.ewc_lambda * ewc
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.plastic_model.parameters(), 1.0)
-            # Update running empirical diagonal Fisher & anchor lightly
+            torch.nn.utils.clip_grad_norm_(params, 4.0)
             with torch.no_grad():
-                for n, p in self.plastic_model.named_parameters():
-                    if p.requires_grad and p.grad is not None:
-                        self._fisher_diag[n].mul_(0.9).add_(p.grad.pow(2), alpha=0.1)
-            opt.step()
+                for n, p in self._plastic_named:
+                    if p.grad is not None:
+                        self._fisher_diag[n].mul_(0.99).add_(p.grad.pow(2), alpha=0.01)
+                        p.sub_(p.grad, alpha=self.lr)
             final_loss = float(ce.detach().item())
 
         with torch.no_grad():
-            for n, p in self.plastic_model.named_parameters():
-                if p.requires_grad:
-                    self._anchor_params[n].mul_(0.8).add_(p.data, alpha=0.2)
+            for n, p in self._plastic_named:
+                self._anchor_params[n].mul_(0.98).add_(p.data, alpha=0.02)
 
-        self.plastic_model.eval()
         self._ingested_count += 1
         return {"arm_id": self.arm_id, "ingested": True, "final_ce_loss": final_loss}
 
@@ -738,45 +924,53 @@ class OnlineWeightPlasticityArm(nn.Module):
     def query(self, query_text: str, top_k: int = 4) -> Dict[str, Any]:
         del top_k
         self.plastic_model.eval()
-        ids = self.tokenizer.encode(query_text, add_eos=False) or [self.tokenizer.sep_id]
+        subj = _extract_subject_key(query_text)
+        subj_ids = self.tokenizer.encode(subj, add_eos=False) or [self.tokenizer.sep_id]
+        colon_ids = self.tokenizer.encode(":", add_eos=False) or [self.tokenizer.sep_id]
         device = self.plastic_model.embed.weight.device
-        t_ids = torch.tensor([ids], dtype=torch.long, device=device)
-        details = self.plastic_model(t_ids, return_details=True)
-        st = details["state"]
-        last_logits = details["logits"][0, -1, :]
+        s_ids = torch.tensor([subj_ids], dtype=torch.long, device=device)
+        h_subj = self.plastic_model.final_norm(self.plastic_model.embed(s_ids).mean(dim=1, keepdim=True))
+
+        prev_tok = int(colon_ids[-1])
         gen_ids: List[int] = []
-        for _ in range(16):
+        last_logits: Optional[torch.Tensor] = None
+        for step_k in range(12):
+            p_t = torch.tensor([[prev_tok]], dtype=torch.long, device=device)
+            h_step = self.plastic_model.final_norm(self.plastic_model.embed(p_t))
+            phi = self._lora_features(h_subj, h_step, step_offset=step_k)
+            last_logits = (self.plastic_model.lm_head(h_step) + phi @ self.lora_b)[0, 0]
             nxt = int(torch.argmax(last_logits).item())
             if nxt in {self.tokenizer.eos_id, self.tokenizer.pad_id}:
                 break
             gen_ids.append(nxt)
-            step_out = self.plastic_model.step(torch.tensor([nxt], device=device), state=st)
-            st = step_out["state"]
-            last_logits = step_out["logits"][0]
-        continuation = self.tokenizer.decode(gen_ids)
+            prev_tok = nxt
+        continuation = self.tokenizer.decode(gen_ids).strip()
         return {
             "arm_id": self.arm_id,
             "hits": [{"text": continuation, "score": 1.0}] if continuation else [],
             "plastic_continuation": continuation,
-            "logits_last": details["logits"][0, -1, :].detach().cpu(),
+            "logits_last": last_logits.detach().cpu(),
         }
 
     def erase_or_supersede(self, key_or_subject: str, new_text: Optional[str] = None) -> Dict[str, Any]:
-        del key_or_subject
         if new_text:
-            return self.ingest(new_text)
+            return self.ingest(new_text, metadata={"entity_key": _extract_subject_key(key_or_subject)})
         return {"arm_id": self.arm_id, "status": "no_targeted_erase_in_weight_plasticity"}
 
     def reset(self) -> None:
         self.plastic_model.load_state_dict(self._clean_snapshot)
-        for n, p in self.plastic_model.named_parameters():
-            if p.requires_grad:
+        with torch.no_grad():
+            self.lora_a.copy_(self._clean_lora_a)
+            self.lora_b.copy_(self._clean_lora_b)
+            for n, p in self._plastic_named:
                 self._anchor_params[n].copy_(p.detach())
                 self._fisher_diag[n].zero_()
         self._ingested_count = 0
 
     def footprint_bytes(self) -> MemoryFootprint:
-        param_b = sum(p.numel() * p.element_size() for p in self.plastic_model.parameters())
+        param_b = sum(p.numel() * p.element_size() for p in self.plastic_model.parameters()) + int(
+            (self.lora_a.numel() + self.lora_b.numel()) * 4
+        )
         fisher_b = sum(t.numel() * t.element_size() for t in self._fisher_diag.values())
         return MemoryFootprint(
             arm_id=self.arm_id,

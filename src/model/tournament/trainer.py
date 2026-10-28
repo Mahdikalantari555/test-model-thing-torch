@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import tempfile
-import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import psutil
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.model.cores.contracts import CandidateLM
 from src.model.cores.objectives import PureCEObjective
@@ -138,6 +137,15 @@ class TournamentTrainer:
 
         self.model = model
         self.objective = objective if objective is not None else PureCEObjective()
+        try:
+            sig = inspect.signature(self.objective.compute_loss)  # type: ignore[attr-defined]
+            self._accepts_raw_hidden = (
+                "raw_hidden_states" in sig.parameters
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            )
+        except (TypeError, ValueError):
+            self._accepts_raw_hidden = False
+
         self.extra_modules = list(extra_modules) if extra_modules is not None else []
         self.all_modules: List[nn.Module] = [self.model, self.objective, *self.extra_modules]
         self.optimizer = build_adamw_optimizer(
@@ -152,6 +160,24 @@ class TournamentTrainer:
         self.step_idx = 0
         self.peak_rss_bytes = 0
         self._proc = psutil.Process(os.getpid())
+
+    def _call_objective(
+        self,
+        input_ids: torch.Tensor,
+        details: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "input_ids": input_ids,
+            "logits": details["logits"],
+            "hidden_states": details["hidden_states"],
+            "raw_embeds": details["raw_embeds"],
+            "pad_id": self.pad_id,
+            "eos_id": self.eos_id,
+        }
+        if self._accepts_raw_hidden:
+            kwargs["raw_hidden_states"] = details.get("raw_hidden_states")
+        return self.objective.compute_loss(**kwargs)  # type: ignore[operator]
 
     def _record_rss(self) -> int:
         rss = int(self._proc.memory_info().rss)
@@ -198,15 +224,7 @@ class TournamentTrainer:
                 continue
             weight = float(scale) * (float(sub_valid) / float(total_valid))
             details = self.model(sub_ids, return_details=True)
-            loss_dict = self.objective.compute_loss(
-                model=self.model,
-                input_ids=sub_ids,
-                logits=details["logits"],
-                hidden_states=details["hidden_states"],
-                raw_embeds=details["raw_embeds"],
-                pad_id=self.pad_id,
-                eos_id=self.eos_id,
-            )
+            loss_dict = self._call_objective(sub_ids, details)
             (loss_dict["total_loss"] * weight).backward()
             ce_sum += float(loss_dict["ce_loss"].detach().item()) * (sub_valid / total_valid)
             aux_sum += float(loss_dict["aux_loss"].detach().item()) * (sub_valid / total_valid)
@@ -216,13 +234,7 @@ class TournamentTrainer:
         return {"ce_loss": ce_sum, "aux_loss": aux_sum, "total_loss": tot_sum}
 
     def _accumulate_online_rtrl(self, input_ids: torch.Tensor, scale: float = 1.0) -> Dict[str, float]:
-        """Online diagonal RTRL across detached temporal windows with carried O(d) eligibility traces.
-
-        For diagonal recurrence `s_t = g_t * s_{t-1} + u_t`, the diagonal decay trace
-        `e_t = d s_t / d theta_decay = g_t * e_{t-1} + (d g_t / d theta_decay) * s_{t-1}`
-        has exact `O(L * B * d)` state and carries parameter sensitivity across detached
-        sequence chunks without storing past activation graphs.
-        """
+        """Online diagonal RTRL across detached temporal windows with carried O(d) eligibility traces."""
         batch, seq_len = input_ids.shape
         win = max(2, int(self.config.rtrl_chunk_len))
         total_chunks = 0
@@ -230,46 +242,32 @@ class TournamentTrainer:
         tot_acc = 0.0
 
         state = self.model.init_state(batch_size=batch, device=input_ids.device)
-        # Carry diagonal eligibility trace e_prev for C0 (`layer.decay`) or C1 (`layer.w_g.bias`)
         core = self.model.core
         trace = torch.zeros_like(state)
 
-        # Overlap 1 token across chunks so every boundary next-token prediction is scored
         stride = max(1, win - 1)
         for start in range(0, max(1, seq_len - 1), stride):
             stop = min(seq_len, start + win)
             if stop - start < 2:
                 break
             sub_ids = input_ids[:, start:stop]
-            # Inject first-order RTRL trace coupling into detached initial state for diagonal decay parameter
             state_detached = state.detach()
             coupled_states: List[torch.Tensor] = []
             for idx, layer in enumerate(core.layers):  # type: ignore[attr-defined]
                 if hasattr(layer, "decay"):
-                    # C0: theta = layer.decay
                     theta = layer.decay.view(1, -1)
                     s_coupled = state_detached[idx] + (theta - theta.detach()) * trace[idx].detach()
                 else:
-                    # C1: theta = layer.w_g.bias
                     theta = layer.w_g.bias.view(1, -1)
                     s_coupled = state_detached[idx] + (theta - theta.detach()) * trace[idx].detach()
                 coupled_states.append(s_coupled)
             state_in = torch.stack(coupled_states, dim=0)
 
             details = self.model(sub_ids, state=state_in, return_details=True)
-            loss_dict = self.objective.compute_loss(
-                model=self.model,
-                input_ids=sub_ids,
-                logits=details["logits"],
-                hidden_states=details["hidden_states"],
-                raw_embeds=details["raw_embeds"],
-                pad_id=self.pad_id,
-                eos_id=self.eos_id,
-            )
+            loss_dict = self._call_objective(sub_ids, details)
             chunk_count = max(1, math.ceil((seq_len - 1) / stride))
             (loss_dict["total_loss"] * (float(scale) / float(chunk_count))).backward()
 
-            # Advance state and diagonal eligibility trace without keeping computation graph
             with torch.no_grad():
                 next_state = details["state"].detach()
                 new_traces: List[torch.Tensor] = []

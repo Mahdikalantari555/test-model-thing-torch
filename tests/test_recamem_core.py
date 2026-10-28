@@ -63,6 +63,11 @@ def test_recamem_core_rejects_incomplete_or_unmeasured_verified_winner() -> None
     with pytest.raises(ValueError, match="unmeasured_metrics_count"):
         recamem_core.validate_selected_core_manifest(_sample_manifest(unmeasured=2))
 
+    untrained_17m = _sample_manifest(selection_status="verified_winner")
+    untrained_17m["tournament_provenance"]["target_17m_trained"] = False
+    with pytest.raises(ValueError, match="provisional_core"):
+        recamem_core.validate_selected_core_manifest(untrained_17m)
+
 
 @pytest.mark.parametrize("arch_mode", ["unified", "split_specialist"])
 def test_build_recamem_core_end_to_end_and_safetensors_roundtrip(tmp_path, arch_mode: str) -> None:
@@ -123,9 +128,13 @@ def test_canonical_selected_core_manifest_loads_active_and_17m_tiers() -> None:
     assert manifest_path.is_file(), "configs/recamem_selected_core.json must exist after tournament execution"
 
     bundle_active = recamem_core.build_recamem_core(manifest_path, use_tier="active")
-    assert bundle_active.manifest["selection_status"] == "verified_winner"
-    assert bundle_active.manifest["tournament_provenance"]["stages_completed"] == [0, 1, 2, 3, 4]
-    assert bundle_active.manifest["tournament_provenance"]["unmeasured_metrics_count"] == 0
+    prov = bundle_active.manifest["tournament_provenance"]
+    if prov.get("target_17m_trained") is False:
+        assert bundle_active.manifest["selection_status"] == "provisional_core"
+    else:
+        assert bundle_active.manifest["selection_status"] == "verified_winner"
+    assert prov["stages_completed"] == [0, 1, 2, 3, 4]
+    assert prov["unmeasured_metrics_count"] == 0
 
     bundle_active.teach("Perigee altitude is 510 km", metadata={"entity_key": "perigee altitude"})
     bundle_active.supersede("perigee altitude", "Perigee altitude is 545 km")

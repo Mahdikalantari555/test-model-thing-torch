@@ -30,13 +30,13 @@
     "core_slug": "gated_delta_matrix",
     "decision_readout_id": "D3",
     "gradient_mode": "chunked_bptt",
-    "memory_arm_id": "M4",
-    "multitask_batching_mode": "summed",
+    "memory_arm_id": "M3",
+    "multitask_batching_mode": "interleaved",
     "objective_id": "O1",
     "router_id": "R4",
     "tokenizer_id": "Tok_bpe_4096"
   },
-  "selection_status": "verified_winner",
+  "selection_status": "provisional_core",
   "target_17m_hyperparameters": {
     "chunk_size": 64,
     "conv_kernel": 4,
@@ -51,6 +51,7 @@
     "state_dim": 16,
     "target_params": 17000000,
     "tier": "target",
+    "trained": false,
     "use_conv": true,
     "vocab_size": 4096,
     "window_size": 256
@@ -80,6 +81,7 @@
       3,
       4
     ],
+    "target_17m_trained": false,
     "unmeasured_metrics_count": 0
   }
 }

@@ -67,6 +67,7 @@ MODULE_TESTS = {
     "src/model/cores/routers.py": "tests/test_action_router.py",
     "src/model/cores/memory_arms.py": "tests/test_candidate_stores.py",
     "src/model/tournament/workloads.py": "tests/test_architecture_tournament.py",
+    "src/model/tournament/large_workloads.py": "tests/test_architecture_tournament.py",
     "src/model/tournament/stats.py": "tests/test_architecture_tournament.py",
     "src/model/tournament/funnel.py": "tests/test_architecture_tournament.py",
     "src/model/recamem_core.py": "tests/test_recamem_core.py",

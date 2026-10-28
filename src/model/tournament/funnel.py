@@ -274,21 +274,25 @@ def _score_core_utility(rec: Mapping[str, Any]) -> float:
 
 
 def _score_decision_utility(rec: Mapping[str, Any]) -> float:
-    in_f1 = float(rec.get("in_domain_macro_f1", 0.0))
+    """Rank decision arms strictly by unseen/shifted generalization and risk-calibration (`shifted_macro_f1`, `oos_f1`, `aurc`, `adaptive_ece`).
+
+    `in_domain_macro_f1` is intentionally excluded from selection utility (reported only as
+    a diagnostic) so memorizing seen option labels never overrides shifted/OOS reliability.
+    """
     sh_f1 = float(rec.get("shifted_macro_f1", 0.0))
     oos_f1 = float(rec.get("oos_f1", 0.0))
-    ece = float(rec.get("adaptive_ece", 0.5))
     aurc = float(rec.get("aurc", 0.5))
-    return 0.30 * in_f1 + 0.35 * sh_f1 + 0.20 * oos_f1 + 0.10 * (1.0 - ece) + 0.05 * (1.0 - aurc)
+    ece = float(rec.get("adaptive_ece", 0.5))
+    return 0.40 * sh_f1 + 0.20 * oos_f1 + 0.20 * (1.0 - aurc) + 0.20 * (1.0 - ece)
 
 
 def _score_router_utility(rec: Mapping[str, Any]) -> float:
+    """Rank router arms by cost-weighted utility, AURC, calibration ECE, and false-tool safety."""
     util = float(rec.get("normalized_utility", 0.0))
     false_tool = float(rec.get("false_tool_rate", 0.0))
     ece = float(rec.get("adaptive_ece", 0.5))
-    lat_ms = max(0.01, float(rec.get("p50_latency_ms", 1.0)))
-    speed_bonus = 1.0 / (1.0 + 0.05 * lat_ms)
-    return 0.55 * util + 0.25 * (1.0 - false_tool) + 0.10 * (1.0 - ece) + 0.10 * speed_bonus
+    aurc = float(rec.get("aurc", ece))
+    return 0.40 * util + 0.20 * (1.0 - false_tool) + 0.20 * (1.0 - aurc) + 0.20 * (1.0 - ece)
 
 
 def _score_memory_utility(rec: Mapping[str, Any]) -> float:
