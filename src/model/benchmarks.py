@@ -64,6 +64,10 @@ __all__ = [
     "find_contamination",
     "measure_held_out_perplexity",
     "compare_reference_paths",
+    "measure_held_out_bpb",
+    "measure_prefill_ttft",
+    "measure_int8_decode_speed",
+    "build_equal_budget_tables",
 ]
 
 REPORT_SCHEMA_VERSION = 1
@@ -664,3 +668,235 @@ def compare_reference_paths(
         load_threshold=load_threshold,
         threshold=SPEED_FACTOR_THRESHOLD,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Cross-tokenizer BPB, TTFT, Dynamic INT8 Decode & Equal-Budget Tables
+# --------------------------------------------------------------------------- #
+def measure_held_out_bpb(
+    train_documents: Mapping[str, str | bytes],
+    held_out_documents: Mapping[str, str | bytes],
+    score_nll_nats: Callable[[Mapping[str, bytes]], Tuple[float, int]],
+    *,
+    vocab_size: int = 256,
+    tokenizer_id: str = "bytes",
+    window: int = PERPLEXITY_WINDOW_BYTES,
+    samples_per_document: int = 8,
+) -> Dict[str, Any]:
+    """Compute cross-tokenizer invariant held-out Bits-Per-Byte (`held_out_bpb`).
+
+    `BPB = total_nll_nats / (ln(2) * total_utf8_bytes)`.
+    Runs the same sliding-window contamination guard as `measure_held_out_perplexity`
+    so contaminated splits are rejected/skipped rather than silently reported.
+    """
+    to_bytes = lambda v: v if isinstance(v, (bytes, bytearray)) else str(v).encode("utf-8")
+    train_bytes = b"\n".join(to_bytes(v) for v in train_documents.values())
+    held_out_bytes = {str(k): bytes(to_bytes(v)) for k, v in held_out_documents.items()}
+
+    if not held_out_bytes:
+        return skipped("held_out_documents is empty", metric="held_out_bpb")
+    if train_bytes:
+        offenders = find_contamination(
+            train_bytes, held_out_bytes, window=window, samples_per_document=samples_per_document
+        )
+        if offenders:
+            return skipped(
+                "held-out windows also appear in training documents: "
+                + ", ".join(sorted({str(o["document_id"]) for o in offenders})),
+                metric="held_out_bpb",
+                contaminated_documents=sorted({str(o["document_id"]) for o in offenders}),
+            )
+
+    total_nll_nats, total_tokens = score_nll_nats(held_out_bytes)
+    raw_utf8_bytes = sum(len(b) for b in held_out_bytes.values())
+    if raw_utf8_bytes <= 0:
+        return skipped("held-out split has zero UTF-8 bytes", metric="held_out_bpb")
+    if not math.isfinite(total_nll_nats):
+        return skipped("NLL accumulator was non-finite", metric="held_out_bpb")
+
+    bpb = float(total_nll_nats) / (math.log(2.0) * float(raw_utf8_bytes))
+    return measurement(
+        bpb,
+        metric="held_out_bpb",
+        utf8_bytes_evaluated=raw_utf8_bytes,
+        tokens_evaluated=int(total_tokens),
+        bytes_per_token=float(raw_utf8_bytes) / float(max(1, total_tokens)),
+        vocab_size=int(vocab_size),
+        tokenizer_id=str(tokenizer_id),
+    )
+
+
+def measure_prefill_ttft(
+    prefill_runner_by_length: Mapping[int, Callable[[], Any]],
+    *,
+    runs: int = 5,
+    warmup: int = 1,
+    variance_threshold: float = VARIANCE_THRESHOLD,
+    load_threshold: float = LOAD_THRESHOLD,
+    load: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Measure prefill Time-To-First-Token (`ttft_ms`) across prompt lengths (e.g. 128..4096)."""
+    measured_load = dict(load) if load is not None else system_load()
+    load_ratio = float(measured_load.get("load_ratio", 0.0) or 0.0)
+    if load_ratio > load_threshold:
+        return skipped(
+            f"machine load ratio {load_ratio:.3f} exceeds {load_threshold}",
+            metric="ttft_ms",
+            load=measured_load,
+            load_threshold=load_threshold,
+        )
+
+    by_len: Dict[str, Any] = {}
+    worst_cv = 0.0
+    for seq_len, fn in sorted(prefill_runner_by_length.items(), key=lambda kv: int(kv[0])):
+        for _ in range(max(0, int(warmup))):
+            fn()
+        samples_ms: List[float] = []
+        for _ in range(max(1, int(runs))):
+            t0 = time.perf_counter()
+            fn()
+            samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        mean_ms = statistics.mean(samples_ms)
+        stdev_ms = statistics.pstdev(samples_ms) if len(samples_ms) > 1 else 0.0
+        cv = stdev_ms / mean_ms if mean_ms > 0 else 0.0
+        worst_cv = max(worst_cv, cv)
+        by_len[str(int(seq_len))] = {
+            "mean_ms": mean_ms,
+            "median_ms": statistics.median(samples_ms),
+            "cv": cv,
+            "runs": len(samples_ms),
+        }
+
+    if worst_cv > variance_threshold:
+        return skipped(
+            f"run-to-run coefficient of variation {worst_cv:.3f} exceeds {variance_threshold}",
+            metric="ttft_ms",
+            by_length=by_len,
+            cv=worst_cv,
+            variance_threshold=variance_threshold,
+            load=measured_load,
+        )
+    return measurement(
+        by_len,
+        metric="ttft_ms",
+        cv=worst_cv,
+        variance_threshold=variance_threshold,
+        load=measured_load,
+        load_threshold=load_threshold,
+        hardware=hardware_description(),
+    )
+
+
+def measure_int8_decode_speed(
+    model: Any,
+    build_decode_fn: Callable[[Any], Callable[[], Any]],
+    tokens_per_run: int,
+    *,
+    bytes_per_token: float = 1.0,
+    runs: int = 5,
+    warmup: int = 1,
+    variance_threshold: float = VARIANCE_THRESHOLD,
+    load_threshold: float = LOAD_THRESHOLD,
+    load: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Quantize a copy of `model` with dynamic INT8 and measure decode tokens/sec & bytes/sec."""
+    import copy
+    import torch
+    import torch.nn as nn
+
+    measured_load = dict(load) if load is not None else system_load()
+    load_ratio = float(measured_load.get("load_ratio", 0.0) or 0.0)
+    if load_ratio > load_threshold:
+        return skipped(
+            f"machine load ratio {load_ratio:.3f} exceeds {load_threshold}",
+            metric="int8_decode_speed",
+            load=measured_load,
+            load_threshold=load_threshold,
+        )
+
+    engines = list(getattr(torch.backends.quantized, "supported_engines", []))
+    if torch.backends.quantized.engine == "none":
+        for candidate_eng in ("fbgemm", "qnnpack", "onednn"):
+            if candidate_eng in engines:
+                torch.backends.quantized.engine = candidate_eng
+                break
+
+    try:
+        import warnings
+        model_copy = copy.deepcopy(model).eval()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            q_model = torch.ao.quantization.quantize_dynamic(
+                model_copy, {nn.Linear}, dtype=torch.qint8
+            )
+    except Exception as exc:
+        return skipped(f"dynamic INT8 quantization unavailable: {exc}", metric="int8_decode_speed")
+
+    decode_fn = build_decode_fn(q_model)
+    tp = measure_throughput(decode_fn, tokens_per_run=tokens_per_run, runs=runs, warmup=warmup, path="int8_decode")
+    if not is_measured(tp):
+        return skipped("INT8 decode throughput produced no valid timing", metric="int8_decode_speed", raw=tp)
+
+    cv = float(tp.get("cv", 0.0))
+    if cv > variance_threshold:
+        return skipped(
+            f"run-to-run coefficient of variation {cv:.3f} exceeds {variance_threshold}",
+            metric="int8_decode_speed",
+            cv=cv,
+            variance_threshold=variance_threshold,
+            load=measured_load,
+        )
+
+    tok_per_s = float(tp["value"])
+    bytes_per_s = tok_per_s * float(bytes_per_token)
+    return measurement(
+        {
+            "int8_tokens_per_second": tok_per_s,
+            "int8_bytes_per_second": bytes_per_s,
+        },
+        metric="int8_decode_speed",
+        bytes_per_token=float(bytes_per_token),
+        cv=cv,
+        variance_threshold=variance_threshold,
+        load=measured_load,
+        load_threshold=load_threshold,
+        quantized_engine=str(torch.backends.quantized.engine),
+    )
+
+
+def build_equal_budget_tables(arm_records: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Produce paired `equal_byte_exposure` and `equal_wall_clock` comparison tables."""
+    equal_byte: List[Dict[str, Any]] = []
+    equal_clock: List[Dict[str, Any]] = []
+    for rec in arm_records:
+        base = {
+            "arm_id": rec.get("arm_id"),
+            "core_id": rec.get("core_id"),
+            "tokenizer_id": rec.get("tokenizer_id"),
+            "vocab_size": rec.get("vocab_size"),
+        }
+        if "equal_byte_bpb" in rec or "held_out_bpb" in rec:
+            equal_byte.append(
+                {
+                    **base,
+                    "utf8_bytes_seen": rec.get("utf8_bytes_seen"),
+                    "held_out_bpb": rec.get("equal_byte_bpb", rec.get("held_out_bpb")),
+                    "train_wall_clock_s": rec.get("equal_byte_wall_clock_s", rec.get("train_wall_clock_s")),
+                }
+            )
+        if "equal_clock_bpb" in rec or "held_out_bpb" in rec:
+            equal_clock.append(
+                {
+                    **base,
+                    "wall_clock_budget_s": rec.get("wall_clock_budget_s", rec.get("train_wall_clock_s")),
+                    "held_out_bpb": rec.get("equal_clock_bpb", rec.get("held_out_bpb")),
+                    "utf8_bytes_seen": rec.get("equal_clock_bytes_seen", rec.get("utf8_bytes_seen")),
+                }
+            )
+    equal_byte.sort(key=lambda r: float(r["held_out_bpb"]) if r["held_out_bpb"] is not None else float("inf"))
+    equal_clock.sort(key=lambda r: float(r["held_out_bpb"]) if r["held_out_bpb"] is not None else float("inf"))
+    return {
+        "equal_byte_exposure": equal_byte,
+        "equal_wall_clock": equal_clock,
+    }
+

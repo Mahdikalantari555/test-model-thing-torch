@@ -1,0 +1,87 @@
+{
+  "calibration": {
+    "decision_temperature": 1.4181571006774902,
+    "router_abstain_threshold": 0.36802735924720764,
+    "router_temperature": 0.23407775163650513
+  },
+  "hyperparameters": {
+    "chunk_size": 64,
+    "conv_kernel": 4,
+    "core_id": "C4",
+    "d_ff": 177,
+    "d_model": 48,
+    "estimated_params": 349920,
+    "memory_injection_mode": "prompt_stuffing",
+    "n_heads": 6,
+    "n_layers": 4,
+    "relative_error": 0.00022857142857142857,
+    "state_dim": 16,
+    "target_params": 350000,
+    "tier": "custom",
+    "use_conv": true,
+    "vocab_size": 4096,
+    "window_size": 256
+  },
+  "schema_version": 1,
+  "selected_architecture": {
+    "architecture_mode": "unified",
+    "complexity_class": "constant_matrix",
+    "core_id": "C4",
+    "core_slug": "gated_delta_matrix",
+    "decision_readout_id": "D3",
+    "gradient_mode": "chunked_bptt",
+    "memory_arm_id": "M3",
+    "multitask_batching_mode": "interleaved",
+    "objective_id": "O1",
+    "router_id": "R4",
+    "tokenizer_id": "Tok_bpe_4096"
+  },
+  "selection_status": "provisional_core",
+  "target_17m_hyperparameters": {
+    "chunk_size": 64,
+    "conv_kernel": 4,
+    "core_id": "C4",
+    "d_ff": 1025,
+    "d_model": 384,
+    "estimated_params": 17000928,
+    "memory_injection_mode": "prompt_stuffing",
+    "n_heads": 6,
+    "n_layers": 8,
+    "relative_error": 5.4588235294117645e-05,
+    "state_dim": 16,
+    "target_params": 17000000,
+    "tier": "target",
+    "trained": false,
+    "use_conv": true,
+    "vocab_size": 4096,
+    "window_size": 256
+  },
+  "tokenizer_artifact_path": "configs/recamem_selected_bpe.json",
+  "tournament_provenance": {
+    "all_stage_gates_evaluated": true,
+    "dataset_source": "fixture",
+    "evidence_ledger_path": "reports/evidence/recamem-core-tournament.json",
+    "kept_optional_components": [
+      "short_conv4"
+    ],
+    "pruned_optional_components": {
+      "ema_jepa_vicreg_aux_loss": "O1_ce_eos",
+      "interleaved_multitask_schedule": "summed_multitask_loss"
+    },
+    "seeds": [
+      1337,
+      2026,
+      4242
+    ],
+    "selection_report_path": "reports/recamem-core-selection.md",
+    "stages_completed": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "target_17m_trained": false,
+    "unmeasured_metrics_count": 0
+  }
+}

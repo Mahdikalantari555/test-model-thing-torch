@@ -1,0 +1,4 @@
+{"id": "blimp-anaphor-01", "phenomenon": "anaphor_agreement", "context": "The satellite calibrated ", "correct": "itself before eclipse.", "incorrect": ["themselves before eclipse.", "herself before eclipse."]}
+{"id": "blimp-det-01", "phenomenon": "determiner_noun_agreement", "context": "Engineers inspected ", "correct": "these sensors carefully.", "incorrect": ["this sensors carefully.", "that sensors carefully."]}
+{"id": "blimp-npi-01", "phenomenon": "npi_licensing", "context": "No ground station has ", "correct": "ever lost telemetry.", "incorrect": ["often lost any telemetry ever.", "already ever lost telemetry."]}
+{"id": "blimp-long-sva-01", "phenomenon": "long_distance_sva", "context": "The calibration tables that the flight computer near the antennas ", "correct": "uses are verified.", "incorrect": ["use is verified.", "using be verified."]}

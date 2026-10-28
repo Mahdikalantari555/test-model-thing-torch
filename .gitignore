@@ -1,4 +1,5 @@
 /.venv/
+/.cache/
 /typings/
 /wikipedia_clean/
 /CoLA/
@@ -12,7 +13,11 @@
 /droids/
 /exports/
 .memdb/
-/reports/
+/reports/*
+!/reports/recamem-core-selection.md
+!/reports/evidence/
+/reports/evidence/*
+!/reports/evidence/recamem-core-tournament.json
 # Real model weights for the manual real-model tier (docs/testing.md).
 # Downloaded by scripts/fetch_real_model.py; never committed.
 /models/

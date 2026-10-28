@@ -261,3 +261,58 @@ def test_speed_factor_threshold_matches_the_parallel_scan_requirement():
     assert "length 512" in spec
     assert benchmarks.SPEED_FACTOR_THRESHOLD == 10.0
     assert benchmarks.SPEED_FACTOR_SEQUENCE_LENGTH == 512
+
+
+def test_held_out_bpb_ttft_int8_decode_and_equal_budget_tables():
+    import math
+    import torch
+    import torch.nn as nn
+
+    train_docs = {"tr1": "Synthetic aperture radar measures interferometric backscatter." * 4}
+    test_docs = {"te1": "Magnetotelluric sounding characterizes crustal conductivity." * 4}
+    total_bytes = len(test_docs["te1"].encode("utf-8"))
+
+    # Both a byte tokenizer (N tokens = total_bytes) and BPE tokenizer (N/3 tokens)
+    # with identical total NLL nats MUST report identical cross-tokenizer BPB!
+    bpb_byte = benchmarks.measure_held_out_bpb(
+        train_docs, test_docs, lambda _: (total_bytes * math.log(2.0) * 1.5, total_bytes), vocab_size=256, tokenizer_id="bytes"
+    )
+    bpb_bpe = benchmarks.measure_held_out_bpb(
+        train_docs, test_docs, lambda _: (total_bytes * math.log(2.0) * 1.5, total_bytes // 3), vocab_size=4096, tokenizer_id="bpe"
+    )
+    assert bpb_byte["status"] == "passed" and bpb_bpe["status"] == "passed"
+    assert abs(bpb_byte["value"] - 1.5) < 1e-6
+    assert abs(bpb_byte["value"] - bpb_bpe["value"]) < 1e-6
+
+    # Load guard skips TTFT cleanly when machine load exceeds 0.40
+    ttft_skip = benchmarks.measure_prefill_ttft(
+        {128: lambda: None}, load={"load_1m": 4.0, "cpu_count": 4, "load_ratio": 0.90}
+    )
+    assert ttft_skip["status"] == "skipped" and "value" not in ttft_skip
+
+    # Dynamic INT8 decode helper
+    tiny = nn.Sequential(nn.Linear(32, 32), nn.SiLU(), nn.Linear(32, 32))
+    x = torch.randn(1, 32)
+    int8_res = benchmarks.measure_int8_decode_speed(
+        tiny,
+        lambda qm: (lambda: [qm(x) for _ in range(8)]),
+        tokens_per_run=8,
+        bytes_per_token=3.2,
+        runs=3,
+        warmup=1,
+        variance_threshold=0.95,
+        load={"load_1m": 0.1, "cpu_count": 4, "load_ratio": 0.025},
+    )
+    assert int8_res["status"] in {"passed", "skipped"}
+    if int8_res["status"] == "passed":
+        assert int8_res["value"]["int8_bytes_per_second"] > int8_res["value"]["int8_tokens_per_second"]
+
+    tables = benchmarks.build_equal_budget_tables(
+        [
+            {"arm_id": "A_bytes", "core_id": "C4", "tokenizer_id": "bytes", "vocab_size": 256, "equal_byte_bpb": 1.42, "equal_clock_bpb": 1.55},
+            {"arm_id": "A_bpe", "core_id": "C4", "tokenizer_id": "bpe", "vocab_size": 4096, "equal_byte_bpb": 1.38, "equal_clock_bpb": 1.31},
+        ]
+    )
+    assert tables["equal_byte_exposure"][0]["arm_id"] == "A_bpe"
+    assert tables["equal_wall_clock"][0]["arm_id"] == "A_bpe"
+

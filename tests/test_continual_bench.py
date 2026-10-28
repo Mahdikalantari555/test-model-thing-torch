@@ -142,6 +142,34 @@ def test_benchmark_report_contains_all_systems_and_task_detail():
     assert "interference" in summary and "target_met" in summary["interference"]
 
 
+def test_domain_retention_matrix_and_contradiction_updates():
+    from src.model.continual_bench import (
+        evaluate_contradiction_updates,
+        evaluate_domain_retention_matrix,
+    )
+    from src.model.cores.memory_arms import build_memory_arm
+    from src.model.cores.param_matcher import solve_core_config
+    from src.model.cores.registry import build_candidate_lm
+    from src.model.cores.tokenizer import build_tokenizer
+    from src.model.tournament.workloads import load_tournament_workloads
+
+    bundle = load_tournament_workloads()
+    tok = build_tokenizer("bytes", vocab_size=256)
+    lm = build_candidate_lm(solve_core_config("C4", tier_or_budget=250_000, vocab_size=256), chunk_size=8)
+    m3 = build_memory_arm("M3", lm, tok)
+
+    ret = evaluate_domain_retention_matrix(m3, bundle.continual_domains)
+    assert len(ret["retention_matrix"]) == 5
+    assert all(len(row) == 5 for row in ret["retention_matrix"])
+    assert ret["average_final_accuracy"] >= 0.75
+    assert ret["backward_forgetting"] <= 0.25
+
+    contra = evaluate_contradiction_updates(m3, bundle.contradiction_pairs)
+    assert contra["contradiction_update_accuracy"] == 1.0
+    assert contra["stale_answer_rate"] == 0.0
+
+
+
 def test_report_is_json_serialisable():
     results = run_benchmark(TINY)
     payload = json.dumps(results)

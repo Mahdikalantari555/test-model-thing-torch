@@ -216,3 +216,72 @@ class DecisionHead:
             "dim": self.dim,
             "K": self.K,
         })
+
+
+class OptionConditionedHead(torch.nn.Module):
+    """Attention-pooled query + dynamic option-set readout (`K in [2, 255]`) + learned null vector."""
+
+    def __init__(self, d_model: int = 384, proj_dim: Optional[int] = None) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.proj_dim = int(proj_dim or d_model)
+        self.query_attn = torch.nn.Linear(self.d_model, 1, bias=False)
+        self.opt_attn = torch.nn.Linear(self.d_model, 1, bias=False)
+        self.w_u = torch.nn.Linear(self.d_model, self.proj_dim, bias=False)
+        self.w_v = torch.nn.Linear(self.d_model, self.proj_dim, bias=False)
+        if self.proj_dim != self.d_model:
+            self.proto_proj: torch.nn.Module = torch.nn.Linear(self.d_model, self.proj_dim, bias=False)
+        else:
+            self.proto_proj = torch.nn.Identity()
+        self.proto_mix_logit = torch.nn.Parameter(torch.tensor(-0.6, dtype=torch.float32))
+        self.null_vec = torch.nn.Parameter(torch.randn(self.proj_dim, dtype=torch.float32) * 0.02)
+        self.null_bias = torch.nn.Parameter(torch.tensor(-0.15, dtype=torch.float32))
+        self.logit_scale = torch.nn.Parameter(torch.tensor(math.log(10.0), dtype=torch.float32))
+
+        torch.nn.init.eye_(self.w_u.weight[: min(self.proj_dim, self.d_model), : min(self.proj_dim, self.d_model)])
+        torch.nn.init.eye_(self.w_v.weight[: min(self.proj_dim, self.d_model), : min(self.proj_dim, self.d_model)])
+
+    def pool_query(self, hidden_states: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+        scores = self.query_attn(hidden_states).squeeze(-1) / math.sqrt(self.d_model)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.bool(), float("-inf"))
+        weights = F.softmax(scores, dim=-1)
+        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
+        return F.normalize(self.w_u(pooled), dim=-1, eps=1e-6)
+
+    def pool_option(self, opt_hidden: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if opt_hidden.dim() == 2:
+            opt_hidden = opt_hidden.unsqueeze(0)
+        scores = self.opt_attn(opt_hidden).squeeze(-1) / math.sqrt(self.d_model)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.bool(), float("-inf"))
+        weights = F.softmax(scores, dim=-1)
+        raw_pool = torch.sum(opt_hidden * weights.unsqueeze(-1), dim=1)
+        mix = torch.sigmoid(self.proto_mix_logit)
+        learned = F.normalize(self.w_v(raw_pool), dim=-1, eps=1e-6)
+        proto = F.normalize(self.proto_proj(raw_pool), dim=-1, eps=1e-6)
+        return F.normalize((1.0 - mix) * learned + mix * proto, dim=-1, eps=1e-6)
+
+    def forward_logits(
+        self,
+        query_hidden: torch.Tensor,
+        option_hiddens: List[torch.Tensor],
+        include_null: bool = True,
+    ) -> torch.Tensor:
+        if not (2 <= len(option_hiddens) <= 255):
+            raise ValueError(f"Expected K in [2, 255] options, got {len(option_hiddens)}")
+        u = self.pool_query(query_hidden)  # (B, P)
+        opt_vecs = [self.pool_option(oh) for oh in option_hiddens]  # K x (1 or B, P)
+        scale = self.logit_scale.exp().clamp(max=50.0)
+        scores = []
+        for vk in opt_vecs:
+            if vk.shape[0] == 1 and u.shape[0] > 1:
+                vk = vk.expand(u.shape[0], -1)
+            scores.append(scale * torch.sum(u * vk, dim=-1))
+        if include_null:
+            v0 = F.normalize(self.null_vec, dim=-1, eps=1e-6).unsqueeze(0).expand(u.shape[0], -1)
+            scores.append(scale * torch.sum(u * v0, dim=-1) + self.null_bias)
+        return torch.stack(scores, dim=-1)
+
